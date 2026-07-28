@@ -6,6 +6,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+import vllm.envs as envs
 from vllm.config import (
     CacheConfig,
     ECTransferConfig,
@@ -22,6 +23,7 @@ from vllm.multimodal.inputs import (
 )
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.utils.hashing import sha256
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
@@ -31,6 +33,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+    MambaSpec,
 )
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
@@ -39,6 +42,80 @@ from vllm.v1.structured_output import StructuredOutputManager
 from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 
 pytestmark = pytest.mark.cpu_test
+
+
+def test_qwen_gdn_batch_invariant_prefill_uses_fixed_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    scheduler = create_scheduler(
+        max_num_batched_tokens=100,
+        max_model_len=256,
+        kv_cache_spec=MambaSpec(
+            block_size=16,
+            shapes=((1, 1),),
+            dtypes=(torch.float32,),
+            mamba_type=MambaAttentionBackendEnum.QWEN_GDN_ATTN,
+            mamba_cache_mode="none",
+        ),
+    )
+    [request] = create_requests(num_requests=1, num_tokens=200)
+    scheduler.add_request(request)
+
+    first = scheduler.schedule()
+    assert first.num_scheduled_tokens[request.request_id] == 64
+    scheduler.update_from_output(
+        first,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    second = scheduler.schedule()
+    assert second.num_scheduled_tokens[request.request_id] == 64
+    scheduler.update_from_output(
+        second,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    final = scheduler.schedule()
+    assert final.num_scheduled_tokens[request.request_id] == 72
+
+
+def test_qwen_gdn_prefill_alignment_is_batch_invariant_only(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", False)
+    scheduler = create_scheduler(
+        max_num_batched_tokens=100,
+        max_model_len=256,
+        kv_cache_spec=MambaSpec(
+            block_size=16,
+            shapes=((1, 1),),
+            dtypes=(torch.float32,),
+            mamba_type=MambaAttentionBackendEnum.QWEN_GDN_ATTN,
+            mamba_cache_mode="none",
+        ),
+    )
+    [request] = create_requests(num_requests=1, num_tokens=200)
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens[request.request_id] == 100
 
 
 def test_add_requests():

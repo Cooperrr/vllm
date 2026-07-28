@@ -95,6 +95,7 @@ def test_v1_generation_is_deterministic_across_batch_sizes_with_needle(
         assert len(baseline_out) == 1
         assert len(baseline_out[0].outputs) >= 1
         baseline_text = baseline_out[0].outputs[0].text
+        baseline_token_ids = baseline_out[0].outputs[0].token_ids
 
         mismatches = 0
 
@@ -117,8 +118,9 @@ def test_v1_generation_is_deterministic_across_batch_sizes_with_needle(
             assert needle_output.prompt == needle_prompt
             assert len(needle_output.outputs) >= 1
             text = needle_output.outputs[0].text
+            token_ids = needle_output.outputs[0].token_ids
 
-            if text != baseline_text:
+            if text != baseline_text or token_ids != baseline_token_ids:
                 print(f"{text}\n\n== Not the same as ==\n\n{baseline_text}\n\n")
                 mismatches += 1
 
@@ -923,6 +925,8 @@ def LLM_with_max_seqs(
         dtype="auto",
         tensor_parallel_size=int(os.getenv("VLLM_TP_SIZE", "1")),
         enable_prefix_caching=False,
+        language_model_only=True,
+        async_scheduling=False,
         attention_config=attention_config,
         # Enable for MOE models
         # enable_expert_parallel=True,

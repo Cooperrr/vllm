@@ -37,10 +37,15 @@ BACKENDS: list[str] = [
 # only run MLA backends when the requested test model is itself an MLA model.
 if os.getenv("VLLM_TEST_MODEL"):
     config = get_config(TEST_MODEL, trust_remote_code=False)
-    if ModelArchConfigConvertorBase(config, config.get_text_config()).is_deepseek_mla():
+    text_config = config.get_text_config()
+    if ModelArchConfigConvertorBase(config, text_config).is_deepseek_mla():
         BACKENDS = ["TRITON_MLA"]
         if flash_attn_supports_mla():
             BACKENDS.append("FLASH_ATTN_MLA")
+    elif getattr(text_config, "model_type", None) == "qwen3_5_text":
+        # Qwen3.5's hybrid cache uses a non-power-of-two attention page size,
+        # which FlexAttention does not support.
+        BACKENDS = [backend for backend in BACKENDS if backend != "FLEX_ATTENTION"]
 
 
 def _random_prompt(min_words: int = 1024, max_words: int = 1024 * 2) -> str:

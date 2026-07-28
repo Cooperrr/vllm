@@ -875,5 +875,14 @@ class KVCacheConfig:
         return any(isinstance(g.kv_cache_spec, MambaSpec) for g in self.kv_cache_groups)
 
     @property
+    def has_qwen_gdn_layers(self) -> bool:
+        return any(
+            isinstance(group.kv_cache_spec, MambaSpec)
+            and group.kv_cache_spec.mamba_type
+            == MambaAttentionBackendEnum.QWEN_GDN_ATTN
+            for group in self.kv_cache_groups
+        )
+
+    @property
     def needs_kv_cache_zeroing(self) -> bool:
         return self.has_mamba_layers

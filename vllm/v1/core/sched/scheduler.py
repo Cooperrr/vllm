@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+from vllm import envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -60,6 +61,8 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+_QWEN_GDN_PREFILL_CHUNK_SIZE = 64
 
 
 class Scheduler(SchedulerInterface):
@@ -261,6 +264,9 @@ class Scheduler(SchedulerInterface):
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
         )
+        self.need_qwen_gdn_prefill_alignment = (
+            envs.VLLM_BATCH_INVARIANT and kv_cache_config.has_qwen_gdn_layers
+        )
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
             self.perf_metrics = ModelMetrics(vllm_config)
@@ -336,6 +342,29 @@ class Scheduler(SchedulerInterface):
                 # prefill the last few tokens
                 pass
         return num_new_tokens
+
+    def _qwen_gdn_batch_invariant_split(
+        self,
+        request: Request,
+        num_new_tokens: int,
+        num_new_local_computed_tokens: int = 0,
+        num_external_computed_tokens: int = 0,
+    ) -> int:
+        """Keep intermediate dense Qwen GDN prefills on the kernel chunk grid."""
+        start = (
+            request.num_computed_tokens
+            + num_new_local_computed_tokens
+            + num_external_computed_tokens
+        )
+        prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
+        if start >= prefill_end:
+            return num_new_tokens
+
+        end = start + num_new_tokens
+        if end < prefill_end:
+            end = end // _QWEN_GDN_PREFILL_CHUNK_SIZE
+            end *= _QWEN_GDN_PREFILL_CHUNK_SIZE
+        return max(end - start, 0)
 
     def schedule(self) -> SchedulerOutput:
         self.current_step += 1
@@ -435,6 +464,10 @@ class Scheduler(SchedulerInterface):
 
             if self.need_mamba_block_aligned_split:
                 num_new_tokens = self._mamba_block_aligned_split(
+                    request, num_new_tokens
+                )
+            if self.need_qwen_gdn_prefill_alignment:
+                num_new_tokens = self._qwen_gdn_batch_invariant_split(
                     request, num_new_tokens
                 )
 
@@ -720,6 +753,15 @@ class Scheduler(SchedulerInterface):
                 # Skip block alignment when setting up async receive (no local work).
                 if self.need_mamba_block_aligned_split and not load_kv_async:
                     num_new_tokens = self._mamba_block_aligned_split(
+                        request,
+                        num_new_tokens,
+                        num_new_local_computed_tokens,
+                        num_external_computed_tokens,
+                    )
+                    if num_new_tokens == 0:
+                        break
+                if self.need_qwen_gdn_prefill_alignment and not load_kv_async:
+                    num_new_tokens = self._qwen_gdn_batch_invariant_split(
                         request,
                         num_new_tokens,
                         num_new_local_computed_tokens,

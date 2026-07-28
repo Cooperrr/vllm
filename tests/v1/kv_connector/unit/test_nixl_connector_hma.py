@@ -879,7 +879,7 @@ def test_compute_physical_blocks_per_logical(ssm_sizes, block_len, expected_rati
         # Qwen/Qwen3.5-0.8B (GDN, symmetric: num_v=num_k=16)
         # key_dim=2048, value_dim=2048, conv_dim=6144
         pytest.param(
-            "gdn_attention",
+            "qwen_gdn_attention",
             1,
             6144,
             3,
@@ -888,7 +888,7 @@ def test_compute_physical_blocks_per_logical(ssm_sizes, block_len, expected_rati
             id="qwen35_08b_tp1",
         ),
         pytest.param(
-            "gdn_attention",
+            "qwen_gdn_attention",
             4,
             1536,
             3,
@@ -899,7 +899,7 @@ def test_compute_physical_blocks_per_logical(ssm_sizes, block_len, expected_rati
         # Qwen/Qwen3.5-4B (GDN, asymmetric: num_v=32, num_k=16, K:V=1:2)
         # key_dim=2048, value_dim=4096, conv_dim=8192
         pytest.param(
-            "gdn_attention",
+            "qwen_gdn_attention",
             1,
             8192,
             3,
@@ -910,7 +910,7 @@ def test_compute_physical_blocks_per_logical(ssm_sizes, block_len, expected_rati
         # Qwen/Qwen3.5-27B (GDN, asymmetric: num_v=48, num_k=16, K:V=1:3)
         # key_dim=2048, value_dim=6144, conv_dim=10240
         pytest.param(
-            "gdn_attention",
+            "qwen_gdn_attention",
             1,
             10240,
             3,
@@ -919,7 +919,7 @@ def test_compute_physical_blocks_per_logical(ssm_sizes, block_len, expected_rati
             id="qwen35_27b_tp1",
         ),
         pytest.param(
-            "gdn_attention",
+            "qwen_gdn_attention",
             8,
             1280,
             3,
@@ -952,6 +952,7 @@ def test_derive_mamba_conv_split(
     _TYPE_MAP = {
         "mamba2": MambaAttentionBackendEnum.MAMBA2,
         "gdn_attention": MambaAttentionBackendEnum.GDN_ATTN,
+        "qwen_gdn_attention": MambaAttentionBackendEnum.QWEN_GDN_ATTN,
     }
     mamba_type_enum = _TYPE_MAP[mamba_type]
 
