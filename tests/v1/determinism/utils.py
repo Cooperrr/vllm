@@ -42,7 +42,8 @@ TEST_MODEL = os.getenv("VLLM_TEST_MODEL", DEFAULT_MODEL)
 # Override backends for MLA models (MLA only supported on CUDA).
 if os.getenv("VLLM_TEST_MODEL"):
     config = get_config(TEST_MODEL, trust_remote_code=False)
-    if ModelArchConfigConvertorBase(config, config.get_text_config()).is_deepseek_mla():
+    text_config = config.get_text_config()
+    if ModelArchConfigConvertorBase(config, text_config).is_deepseek_mla():
         DEVICE_BACKENDS["cuda"] = DeviceConfig(
             available=DEVICE_BACKENDS["cuda"].available,
             backends=["TRITON_MLA"]
@@ -51,6 +52,17 @@ if os.getenv("VLLM_TEST_MODEL"):
         DEVICE_BACKENDS["xpu"] = DeviceConfig(
             available=DEVICE_BACKENDS["xpu"].available,
             backends=[],
+        )
+    elif getattr(text_config, "model_type", None) == "qwen3_5_text":
+        # Qwen3.5's hybrid cache uses a non-power-of-two attention page size,
+        # which FlexAttention does not support.
+        DEVICE_BACKENDS["cuda"] = DeviceConfig(
+            available=DEVICE_BACKENDS["cuda"].available,
+            backends=[
+                backend
+                for backend in DEVICE_BACKENDS["cuda"].backends
+                if backend != "FLEX_ATTENTION"
+            ],
         )
 
 # Only include backends for devices that are actually available.

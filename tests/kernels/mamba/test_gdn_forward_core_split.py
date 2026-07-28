@@ -22,9 +22,9 @@ Both paths are exercised through the REAL ``_forward_core``:
   non-spec tokens in both paths, so it cancels out and only the recurrent split
   is compared).
 
-The Triton/FLA chunk backend is forced so the prefill-only ``chunk_indices``
-must stay consistent with the rebased ``cu_seqlens`` (a stringent, backend
-portable check of the split wiring).
+The device's supported chunk backend is forced so the prefill-only
+``chunk_indices`` must stay consistent with the rebased ``cu_seqlens`` (a
+stringent, backend-portable check of the split wiring).
 """
 
 from __future__ import annotations
@@ -36,14 +36,15 @@ from unittest.mock import patch
 import pytest
 import torch
 
+import vllm.envs as envs
 from vllm.platforms import current_platform
 
-if not (
-    current_platform.is_cuda() and current_platform.is_device_capability_family(100)
+if not current_platform.is_cuda() or not (
+    any(current_platform.is_device_capability(cap) for cap in (86, 89, 90))
+    or current_platform.is_device_capability_family(100)
 ):
     pytest.skip(
-        reason="GDN _forward_core split test uses the CuteDSL prefill backend "
-        "(requires CUDA SM10x).",
+        reason="GDN _forward_core split tests require CUDA SM86/89/90/10x.",
         allow_module_level=True,
     )
 
@@ -69,6 +70,7 @@ from vllm.third_party.flash_linear_attention.ops.utils import (  # noqa: E402
     FLA_CHUNK_SIZE,
 )
 from vllm.v1.attention.backends.gdn_attn import (  # noqa: E402
+    GDNAttentionMetadata,
     GDNAttentionMetadataBuilder,
 )
 from vllm.v1.kv_cache_interface import MambaSpec  # noqa: E402
@@ -88,27 +90,36 @@ PREFIX = "model.layers.0.linear_attn"
 
 def _make_vllm_config():
     # A small, ungated GDN model whose config is cached locally; only the config
-    # (scheduler/cache/compilation/hf) is used here, never the weights. Inject
-    # linear_key_head_dim=128 and request the CuteDSL prefill backend -- the
-    # supported GDN chunk kernel on Blackwell (the Triton/FLA chunk kernel is
-    # unsupported on SM10x). CuteDSL consumes chunk_indices/chunk_offsets, so
-    # this also exercises the prefill-only chunk-metadata wiring.
-    cfg = create_vllm_config(
-        model_name="Qwen/Qwen3.5-0.8B",
-        block_size=BLOCK_SIZE,
-        hf_config_override={"linear_key_head_dim": K},
+    # (scheduler/cache/compilation/hf) is used here, never the weights. Build it
+    # outside the validated serving profile because this test supplies a
+    # minimal layer directly.
+    with patch.object(envs, "VLLM_BATCH_INVARIANT", False):
+        cfg = create_vllm_config(
+            model_name="Qwen/Qwen3.5-0.8B",
+            block_size=BLOCK_SIZE,
+            hf_config_override={"linear_key_head_dim": K},
+        )
+    backend = (
+        "cutedsl" if current_platform.is_device_capability_family(100) else "triton"
     )
-    cfg.additional_config = {"gdn_prefill_backend": "cutedsl"}
+    cfg.additional_config = {"gdn_prefill_backend": backend}
     return cfg
 
 
 def _build_layer(
-    vllm_config, conv_state, ssm_state, A_log, dt_bias, conv_weight, conv_bias
+    vllm_config,
+    conv_state,
+    ssm_state,
+    A_log,
+    dt_bias,
+    conv_weight,
+    conv_bias,
+    enable_packed_recurrent_decode=False,
 ):
     """A minimal object that runs the real ``_forward_core`` bound to it."""
     layer = types.SimpleNamespace()
     layer.prefix = PREFIX
-    layer.enable_packed_recurrent_decode = False
+    layer.enable_packed_recurrent_decode = enable_packed_recurrent_decode
     layer.tp_size = 1
     layer.num_k_heads = H
     layer.num_v_heads = HV
@@ -126,6 +137,8 @@ def _build_layer(
     for name in (
         "rearrange_mixed_qkv",
         "_forward_core",
+        "_forward_core_decode_non_spec",
+        "_forward_packed_recurrent_decode",
     ):
         setattr(
             layer,
@@ -154,11 +167,13 @@ def _run_forward_core(layer, meta, mixed_qkv, b, a, num_tokens):
 @pytest.mark.parametrize("num_decodes,prefill_lens", [(3, [512, 300]), (4, [64, 5])])
 @pytest.mark.parametrize("fresh_prefill", [False, True])
 def test_forward_core_split_matches_unified(
+    monkeypatch: pytest.MonkeyPatch,
     state_dtype: torch.dtype,
     num_decodes: int,
     prefill_lens: list[int],
     fresh_prefill: bool,
 ) -> None:
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", False)
     torch.manual_seed(0)
     device = torch.device("cuda")
     vllm_config = _make_vllm_config()
@@ -191,7 +206,10 @@ def test_forward_core_split_matches_unified(
     assert meta_split.num_decodes == num_decodes
     assert meta_split.num_prefills == len(prefill_lens)
     assert meta_split.num_decode_tokens == num_decodes
-    assert builder.gdn_prefill_backend == "cutedsl"
+    expected_backend = (
+        "cutedsl" if current_platform.is_device_capability_family(100) else "triton"
+    )
+    assert builder.gdn_prefill_backend == expected_backend
 
     num_tokens = sum(query_lens)
 
@@ -296,3 +314,124 @@ def test_forward_core_split_matches_unified(
         atol = rtol = 6e-2
     torch.testing.assert_close(out_split, out_unified, atol=atol, rtol=rtol)
     torch.testing.assert_close(ssm_state_split, ssm_state_unified, atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize("enable_packed_recurrent_decode", [False, True])
+def test_decode_is_bitwise_invariant_in_mixed_batch(
+    monkeypatch: pytest.MonkeyPatch,
+    enable_packed_recurrent_decode: bool,
+) -> None:
+    """A cached decode row keeps its conv and recurrent kernels in a mixed step."""
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_decodes = 2
+    num_prefill_tokens = 3
+    num_tokens = num_decodes + num_prefill_tokens
+
+    conv_state_shape, temporal_state_shape = (
+        MambaStateShapeCalculator.gated_delta_net_state_shape(
+            1, H, HV, K, V, CONV_KERNEL, num_spec=0
+        )
+    )
+    conv_state = torch.randn(3, *conv_state_shape, dtype=dtype, device=device) * 0.05
+    ssm_state = (
+        torch.randn(3, *temporal_state_shape, dtype=torch.float32, device=device) * 0.05
+    )
+    A_log = torch.randn(HV, dtype=torch.float32, device=device) * 0.1
+    dt_bias = torch.randn(HV, dtype=torch.float32, device=device) * 0.1
+    conv_weight = (
+        torch.randn(CONV_DIM, 1, CONV_KERNEL, dtype=dtype, device=device) * 0.1
+    )
+    conv_bias = torch.randn(CONV_DIM, dtype=dtype, device=device) * 0.1
+    mixed_qkv = torch.randn(num_tokens, CONV_DIM, dtype=dtype, device=device) * 0.1
+    a = torch.randn(num_tokens, HV, dtype=dtype, device=device) * 0.1
+    b = torch.randn(num_tokens, HV, dtype=dtype, device=device) * 0.1
+    state_indices = torch.arange(3, dtype=torch.int32, device=device)
+
+    decode_metadata = GDNAttentionMetadata(
+        num_prefills=0,
+        num_prefill_tokens=0,
+        num_decodes=num_decodes,
+        num_decode_tokens=num_decodes,
+        num_spec_decodes=0,
+        num_spec_decode_tokens=0,
+        num_actual_tokens=num_decodes,
+        non_spec_query_start_loc=torch.arange(
+            num_decodes + 1, dtype=torch.int32, device=device
+        ),
+        non_spec_state_indices_tensor=state_indices[:num_decodes],
+    )
+    mixed_metadata = GDNAttentionMetadata(
+        num_prefills=1,
+        num_prefill_tokens=num_prefill_tokens,
+        num_decodes=num_decodes,
+        num_decode_tokens=num_decodes,
+        num_spec_decodes=0,
+        num_spec_decode_tokens=0,
+        num_actual_tokens=num_tokens,
+        has_initial_state=torch.tensor(
+            [True, True, False], dtype=torch.bool, device=device
+        ),
+        non_spec_query_start_loc=torch.tensor(
+            [0, 1, 2, num_tokens], dtype=torch.int32, device=device
+        ),
+        non_spec_state_indices_tensor=state_indices,
+        prefill_query_start_loc=torch.tensor(
+            [0, num_prefill_tokens], dtype=torch.int32, device=device
+        ),
+        prefill_state_indices=state_indices[num_decodes:],
+        prefill_has_initial_state=torch.tensor(
+            [False], dtype=torch.bool, device=device
+        ),
+    )
+
+    def prefill_stub(
+        *,
+        v: torch.Tensor,
+        initial_state: torch.Tensor,
+        **kwargs,
+    ):
+        return torch.zeros_like(v), initial_state.clone()
+
+    def run(metadata, initial_conv_state, initial_ssm_state):
+        layer = _build_layer(
+            _make_vllm_config(),
+            initial_conv_state,
+            initial_ssm_state,
+            A_log,
+            dt_bias,
+            conv_weight,
+            conv_bias,
+            enable_packed_recurrent_decode=enable_packed_recurrent_decode,
+        )
+        layer.chunk_gated_delta_rule = prefill_stub
+        output = _run_forward_core(
+            layer, metadata, mixed_qkv, b, a, metadata.num_actual_tokens
+        )
+        return output, layer.kv_cache
+
+    decode_output, decode_cache = run(
+        decode_metadata, conv_state.clone(), ssm_state.clone()
+    )
+    mixed_output, mixed_cache = run(
+        mixed_metadata, conv_state.clone(), ssm_state.clone()
+    )
+
+    torch.testing.assert_close(
+        mixed_output[:num_decodes], decode_output, atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        mixed_cache[0][:num_decodes],
+        decode_cache[0][:num_decodes],
+        atol=0,
+        rtol=0,
+    )
+    torch.testing.assert_close(
+        mixed_cache[1][:num_decodes],
+        decode_cache[1][:num_decodes],
+        atol=0,
+        rtol=0,
+    )
