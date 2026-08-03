@@ -267,6 +267,12 @@ class Scheduler(SchedulerInterface):
         self.need_qwen_gdn_prefill_alignment = (
             envs.VLLM_BATCH_INVARIANT and kv_cache_config.has_qwen_gdn_layers
         )
+        if self.need_mamba_block_aligned_split and self.need_qwen_gdn_prefill_alignment:
+            raise ValueError(
+                "Mamba block-aligned splitting and Qwen GDN batch-invariant "
+                "prefill alignment are mutually exclusive; Qwen GDN batch "
+                "invariance requires mamba_cache_mode='none'."
+            )
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
             self.perf_metrics = ModelMetrics(vllm_config)
@@ -466,7 +472,7 @@ class Scheduler(SchedulerInterface):
                 num_new_tokens = self._mamba_block_aligned_split(
                     request, num_new_tokens
                 )
-            if self.need_qwen_gdn_prefill_alignment:
+            elif self.need_qwen_gdn_prefill_alignment:
                 num_new_tokens = self._qwen_gdn_batch_invariant_split(
                     request, num_new_tokens
                 )
@@ -760,7 +766,7 @@ class Scheduler(SchedulerInterface):
                     )
                     if num_new_tokens == 0:
                         break
-                if self.need_qwen_gdn_prefill_alignment and not load_kv_async:
+                elif self.need_qwen_gdn_prefill_alignment and not load_kv_async:
                     num_new_tokens = self._qwen_gdn_batch_invariant_split(
                         request,
                         num_new_tokens,

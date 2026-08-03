@@ -118,6 +118,24 @@ def test_qwen_gdn_prefill_alignment_is_batch_invariant_only(
     assert output.num_scheduled_tokens[request.request_id] == 100
 
 
+def test_qwen_gdn_prefill_alignment_rejects_mamba_alignment(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        create_scheduler(
+            kv_cache_spec=MambaSpec(
+                block_size=16,
+                shapes=((1, 1),),
+                dtypes=(torch.float32,),
+                mamba_type=MambaAttentionBackendEnum.QWEN_GDN_ATTN,
+                mamba_cache_mode="align",
+            ),
+            mamba_cache_mode="align",
+        )
+
+
 def test_add_requests():
     scheduler = create_scheduler()
     requests = create_requests(num_requests=10)
