@@ -847,8 +847,26 @@ class Qwen3_5ForConditionalGenerationConfig(VerifyAndUpdateConfig):
             and ec_transfer_config.is_ec_transfer_instance
         ):
             invalid_reasons.append("KV and EC connectors are not supported")
-        if scheduler_config.max_num_batched_tokens < 64:
-            invalid_reasons.append("max_num_batched_tokens must be at least 64")
+
+        prefill_chunk_size = 64
+        if scheduler_config.max_num_batched_tokens < prefill_chunk_size:
+            invalid_reasons.append(
+                f"max_num_batched_tokens must be at least {prefill_chunk_size}"
+            )
+        if (
+            scheduler_config.max_num_scheduled_tokens is not None
+            and scheduler_config.max_num_scheduled_tokens < prefill_chunk_size
+        ):
+            invalid_reasons.append(
+                f"max_num_scheduled_tokens must be at least {prefill_chunk_size} "
+                "when set"
+            )
+        long_prefill_token_threshold = scheduler_config.long_prefill_token_threshold
+        if 0 < long_prefill_token_threshold < prefill_chunk_size:
+            invalid_reasons.append(
+                "long_prefill_token_threshold must be at least "
+                f"{prefill_chunk_size} when enabled"
+            )
 
         if invalid_reasons:
             reasons = "; ".join(invalid_reasons)
