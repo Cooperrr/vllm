@@ -74,9 +74,13 @@ def _qwen_gdn_batch_invariant_config() -> SimpleNamespace:
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_qwen_gdn_batch_invariant_profile_accepts_supported_config(dtype):
+@pytest.mark.parametrize("async_scheduling", [False, True, None])
+def test_qwen_gdn_batch_invariant_profile_accepts_supported_config(
+    dtype, async_scheduling
+):
     config = _qwen_gdn_batch_invariant_config()
     config.model_config.dtype = dtype
+    config.scheduler_config.async_scheduling = async_scheduling
 
     Qwen3_5ForConditionalGenerationConfig._verify_batch_invariant_profile(config)
 
@@ -110,7 +114,6 @@ def test_qwen_gdn_batch_invariant_profile_reports_all_violations():
     config.cache_config.enable_prefix_caching = True
     config.cache_config.mamba_cache_mode = "align"
     config.kv_transfer_config = SimpleNamespace(is_kv_transfer_instance=True)
-    config.scheduler_config.async_scheduling = True
     config.scheduler_config.max_num_batched_tokens = 63
 
     with pytest.raises(ValueError) as exc_info:
@@ -128,7 +131,6 @@ def test_qwen_gdn_batch_invariant_profile_reports_all_violations():
         "prefix caching must be disabled",
         "mamba cache mode must be 'none'",
         "KV and EC connectors are not supported",
-        "--no-async-scheduling must be set",
         "max_num_batched_tokens must be at least 64",
     )
     assert all(reason in message for reason in expected_reasons)

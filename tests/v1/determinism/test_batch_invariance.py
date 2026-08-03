@@ -110,6 +110,7 @@ def test_v1_generation_is_deterministic_across_batch_sizes_with_needle(
             attention_config=attention_config,
             kernel_config=kernel_config,
         )
+        assert llm.llm_engine.vllm_config.scheduler_config.async_scheduling is True
 
         # Baseline generation for the needle prompt alone.
         baseline_out = llm.generate([needle_prompt], sampling)
@@ -956,7 +957,7 @@ def LLM_with_max_seqs(
         tensor_parallel_size=int(os.getenv("VLLM_TP_SIZE", "1")),
         enable_prefix_caching=False,
         language_model_only=True,
-        async_scheduling=False,
+        async_scheduling=True,
         attention_config=attention_config,
         # Enable for MOE models
         # enable_expert_parallel=True,
