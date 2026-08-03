@@ -6,17 +6,66 @@ from types import SimpleNamespace
 
 import pytest
 
+from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+    QwenGatedDeltaNetAttention,
+)
 from vllm.model_executor.layers.mamba.linear.minimax_linear_attn import (
     MiniMaxText01LinearAttention,
 )
 from vllm.model_executor.layers.mamba.mamba_mixer import MambaMixer
 from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
 from vllm.model_executor.layers.mamba.short_conv import ShortConv
+from vllm.v1.attention.backends.gdn_attn import QwenGDNAttentionBackend
 from vllm.v1.attention.backends.linear_attn import LinearAttentionBackend
 from vllm.v1.attention.backends.mamba1_attn import Mamba1AttentionBackend
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionBackend
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.attention.backends.short_conv_attn import ShortConvAttentionBackend
+
+
+@pytest.mark.parametrize(
+    ("model_type", "expected"),
+    [
+        ("qwen3_5_text", MambaAttentionBackendEnum.QWEN_GDN_ATTN),
+        ("qwen3_5_moe_text", MambaAttentionBackendEnum.GDN_ATTN),
+        ("qwen3_next", MambaAttentionBackendEnum.GDN_ATTN),
+    ],
+)
+def test_only_dense_qwen_gdn_uses_batch_invariant_backend(model_type, expected):
+    layer = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(model_type=model_type)
+        )
+    )
+
+    assert QwenGatedDeltaNetAttention.mamba_type.__get__(layer) == expected
+
+
+@pytest.mark.parametrize(
+    ("capability", "expected"),
+    [
+        (80, False),
+        (86, True),
+        (89, True),
+        (90, True),
+        (100, False),
+        (120, True),
+    ],
+)
+def test_qwen_gdn_batch_invariance_capability_gate(
+    monkeypatch: pytest.MonkeyPatch,
+    capability: int,
+    expected: bool,
+):
+    from vllm import platforms
+
+    platform = SimpleNamespace(
+        is_cuda=lambda: True,
+        is_device_capability=lambda candidate: candidate == capability,
+    )
+    monkeypatch.setattr(platforms, "current_platform", platform)
+
+    assert QwenGDNAttentionBackend.supports_batch_invariance() is expected
 
 
 @pytest.mark.parametrize(

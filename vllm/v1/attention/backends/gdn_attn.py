@@ -7,6 +7,7 @@ from typing import Literal
 
 import torch
 
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
@@ -36,6 +37,30 @@ class GDNAttentionBackend(AttentionBackend):
     @classmethod
     def is_ssm(cls) -> bool:
         return True
+
+
+class QwenGDNAttentionBackend(GDNAttentionBackend):
+    """GDN backend for the batch-invariant dense Qwen CUDA path."""
+
+    @staticmethod
+    def get_name() -> str:
+        return "QWEN_GDN_ATTN"
+
+    @classmethod
+    def supports_batch_invariance(cls) -> bool:
+        from vllm.platforms import current_platform
+
+        return current_platform.is_cuda() and any(
+            current_platform.is_device_capability(capability)
+            for capability in (86, 89, 90, 120)
+        )
+
+
+@dataclass
+class GDNPrefillConvMetadata:
+    nums_dict: dict
+    batch_ptr: torch.Tensor
+    token_chunk_offset_ptr: torch.Tensor
 
 
 @dataclass
@@ -72,6 +97,7 @@ class GDNAttentionMetadata:
     prefill_query_start_loc: torch.Tensor | None = None
     prefill_state_indices: torch.Tensor | None = None
     prefill_has_initial_state: torch.Tensor | None = None
+    prefill_conv_metadata: GDNPrefillConvMetadata | None = None
 
     # The following attributes are for triton implementation of causal_conv1d
     nums_dict: dict | None = None
@@ -330,6 +356,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         prefill_query_start_loc: torch.Tensor | None = None
         prefill_state_indices: torch.Tensor | None = None
         prefill_has_initial_state: torch.Tensor | None = None
+        prefill_conv_metadata: GDNPrefillConvMetadata | None = None
         if num_prefills > 0:
             from vllm.third_party.flash_linear_attention.ops.utils import (
                 FLA_CHUNK_SIZE,
@@ -393,16 +420,33 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             if spec_sequence_masks_cpu is not None:
                 has_initial_state = has_initial_state[~spec_sequence_masks_cpu]
                 assert non_spec_query_start_loc_cpu is not None
-            nums_dict, batch_ptr, token_chunk_offset_ptr = (
-                compute_causal_conv1d_metadata(
-                    non_spec_query_start_loc_cpu,
-                    device=query_start_loc.device,
-                )
-            )
             if spec_sequence_masks is None and num_decodes > 0:
                 prefill_has_initial_state = has_initial_state[num_decodes:]
             else:
                 prefill_has_initial_state = has_initial_state
+
+            assert non_spec_query_start_loc_cpu is not None
+            use_prefill_conv_metadata = (
+                envs.VLLM_BATCH_INVARIANT
+                and spec_sequence_masks is None
+                and num_decodes > 0
+            )
+            conv_query_start_loc_cpu = non_spec_query_start_loc_cpu
+            if use_prefill_conv_metadata:
+                assert prefill_query_start_loc_cpu is not None
+                conv_query_start_loc_cpu = prefill_query_start_loc_cpu
+            nums_dict, batch_ptr, token_chunk_offset_ptr = (
+                compute_causal_conv1d_metadata(
+                    conv_query_start_loc_cpu,
+                    device=query_start_loc.device,
+                )
+            )
+            if use_prefill_conv_metadata:
+                prefill_conv_metadata = GDNPrefillConvMetadata(
+                    nums_dict=nums_dict,
+                    batch_ptr=batch_ptr,
+                    token_chunk_offset_ptr=token_chunk_offset_ptr,
+                )
         else:
             has_initial_state = None
 
@@ -498,6 +542,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             prefill_query_start_loc=prefill_query_start_loc,
             prefill_state_indices=prefill_state_indices,
             prefill_has_initial_state=prefill_has_initial_state,
+            prefill_conv_metadata=prefill_conv_metadata,
             spec_query_start_loc=spec_query_start_loc,
             non_spec_query_start_loc=non_spec_query_start_loc,
             spec_state_indices_tensor=spec_state_indices_tensor,

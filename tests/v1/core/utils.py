@@ -15,6 +15,7 @@ from vllm.config import (
     SpeculativeConfig,
     VllmConfig,
 )
+from vllm.config.cache import MambaCacheMode
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
     MultiModalKwargsItem,
@@ -69,6 +70,7 @@ def create_scheduler(
     ec_role: str | None = None,
     use_v2_model_runner: bool | None = None,
     kv_cache_spec: KVCacheSpec | None = None,
+    mamba_cache_mode: MambaCacheMode = "none",
 ) -> Scheduler | AsyncScheduler:
     """Create scheduler under test.
 
@@ -110,6 +112,7 @@ def create_scheduler(
         gpu_memory_utilization=0.9,
         cache_dtype="auto",
         enable_prefix_caching=enable_prefix_caching,
+        mamba_cache_mode=mamba_cache_mode,
     )
     kv_transfer_config = None
     if isinstance(use_kv_connector, MockKVConfig):

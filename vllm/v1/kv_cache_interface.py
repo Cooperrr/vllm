@@ -973,6 +973,15 @@ class KVCacheConfig:
         return any(isinstance(g.kv_cache_spec, MambaSpec) for g in self.kv_cache_groups)
 
     @property
+    def has_qwen_gdn_layers(self) -> bool:
+        return any(
+            isinstance(group.kv_cache_spec, MambaSpec)
+            and group.kv_cache_spec.mamba_type
+            == MambaAttentionBackendEnum.QWEN_GDN_ATTN
+            for group in self.kv_cache_groups
+        )
+
+    @property
     def has_mixed_precision_kv_cache(self) -> bool:
         """Whether attention groups store their KV cache at more than one precision."""
         kv_cache_precisions: set[tuple[torch.dtype, KVQuantMode]] = set()
