@@ -64,6 +64,8 @@ def _qwen_gdn_batch_invariant_config() -> SimpleNamespace:
         scheduler_config=SimpleNamespace(
             async_scheduling=False,
             max_num_batched_tokens=64,
+            max_num_scheduled_tokens=None,
+            long_prefill_token_threshold=0,
         ),
         lora_config=None,
         speculative_config=None,
@@ -80,6 +82,37 @@ def test_qwen_gdn_batch_invariant_profile_accepts_supported_config(
     config = _qwen_gdn_batch_invariant_config()
     config.model_config.dtype = dtype
     config.scheduler_config.async_scheduling = async_scheduling
+
+    Qwen3_5ForConditionalGenerationConfig._verify_batch_invariant_profile(config)
+
+
+@pytest.mark.parametrize(
+    "setting",
+    [
+        "max_num_batched_tokens",
+        "max_num_scheduled_tokens",
+        "long_prefill_token_threshold",
+    ],
+)
+def test_qwen_gdn_batch_invariant_profile_rejects_sub_chunk_limit(setting):
+    config = _qwen_gdn_batch_invariant_config()
+    setattr(config.scheduler_config, setting, 63)
+
+    with pytest.raises(ValueError, match=f"{setting} must be at least 64"):
+        Qwen3_5ForConditionalGenerationConfig._verify_batch_invariant_profile(config)
+
+
+@pytest.mark.parametrize(
+    "setting",
+    [
+        "max_num_batched_tokens",
+        "max_num_scheduled_tokens",
+        "long_prefill_token_threshold",
+    ],
+)
+def test_qwen_gdn_batch_invariant_profile_accepts_chunk_sized_limit(setting):
+    config = _qwen_gdn_batch_invariant_config()
+    setattr(config.scheduler_config, setting, 64)
 
     Qwen3_5ForConditionalGenerationConfig._verify_batch_invariant_profile(config)
 
@@ -114,6 +147,8 @@ def test_qwen_gdn_batch_invariant_profile_reports_all_violations():
     config.cache_config.mamba_cache_mode = "align"
     config.kv_transfer_config = SimpleNamespace(is_kv_transfer_instance=True)
     config.scheduler_config.max_num_batched_tokens = 63
+    config.scheduler_config.max_num_scheduled_tokens = 63
+    config.scheduler_config.long_prefill_token_threshold = 63
 
     with pytest.raises(ValueError) as exc_info:
         Qwen3_5ForConditionalGenerationConfig._verify_batch_invariant_profile(config)
@@ -131,6 +166,8 @@ def test_qwen_gdn_batch_invariant_profile_reports_all_violations():
         "mamba cache mode must be 'none'",
         "KV and EC connectors are not supported",
         "max_num_batched_tokens must be at least 64",
+        "max_num_scheduled_tokens must be at least 64 when set",
+        "long_prefill_token_threshold must be at least 64 when enabled",
     )
     assert all(reason in message for reason in expected_reasons)
 
