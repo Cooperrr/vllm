@@ -72,15 +72,17 @@ def _qwen_gdn_batch_invariant_config() -> SimpleNamespace:
     )
 
 
-def test_qwen_gdn_batch_invariant_profile_accepts_supported_config():
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_qwen_gdn_batch_invariant_profile_accepts_supported_config(dtype):
     config = _qwen_gdn_batch_invariant_config()
+    config.model_config.dtype = dtype
 
     Qwen3_5ForConditionalGenerationConfig._verify_batch_invariant_profile(config)
 
 
 def test_qwen_gdn_batch_invariant_profile_reports_all_violations():
     config = _qwen_gdn_batch_invariant_config()
-    config.model_config.dtype = torch.float16
+    config.model_config.dtype = torch.float32
     config.model_config.quantization = "fp8"
     config.model_config.multimodal_config.language_model_only = False
     config.parallel_config.tensor_parallel_size = 2
@@ -98,7 +100,7 @@ def test_qwen_gdn_batch_invariant_profile_reports_all_violations():
 
     message = str(exc_info.value)
     expected_reasons = (
-        "dtype must be bfloat16",
+        "dtype must be bfloat16 or float16",
         "quantized weights are not supported",
         "--language-model-only must be enabled",
         "tensor parallel size must be 1",

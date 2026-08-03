@@ -317,16 +317,17 @@ def test_forward_core_split_matches_unified(
 
 
 @pytest.mark.parametrize("enable_packed_recurrent_decode", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_decode_is_bitwise_invariant_in_mixed_batch(
     monkeypatch: pytest.MonkeyPatch,
     enable_packed_recurrent_decode: bool,
+    dtype: torch.dtype,
 ) -> None:
     """A cached decode row keeps its conv and recurrent kernels in a mixed step."""
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
     monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
     torch.manual_seed(0)
     device = torch.device("cuda")
-    dtype = torch.bfloat16
     num_decodes = 2
     num_prefill_tokens = 3
     num_tokens = num_decodes + num_prefill_tokens
