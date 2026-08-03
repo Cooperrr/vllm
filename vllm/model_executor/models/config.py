@@ -576,9 +576,8 @@ class Qwen3_5ForConditionalGenerationConfig(VerifyAndUpdateConfig):
         scheduler_config = vllm_config.scheduler_config
         invalid_reasons: list[str] = []
 
-        # TODO: Relax each restriction as its configuration gains exactness tests.
-        if model_config.dtype != torch.bfloat16:
-            invalid_reasons.append("dtype must be bfloat16")
+        if model_config.dtype not in (torch.bfloat16, torch.float16):
+            invalid_reasons.append("dtype must be bfloat16 or float16")
         if (
             model_config.quantization is not None
             or model_config.quantization_config is not None

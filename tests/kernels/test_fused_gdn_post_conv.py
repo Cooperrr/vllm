@@ -70,7 +70,7 @@ def reference_post_conv(
 @pytest.mark.parametrize("L", [1, 16, 128, 512, 2048])
 @pytest.mark.parametrize("apply_l2norm", [True, False])
 @pytest.mark.parametrize("output_g_exp", [True, False])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_fused_post_conv_correctness(H, HV, K, V, L, apply_l2norm, output_g_exp, dtype):
     """Test fused kernel matches reference for all configs."""
     torch.manual_seed(42)
