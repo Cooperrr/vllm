@@ -639,8 +639,6 @@ class Qwen3_5ForConditionalGenerationConfig(VerifyAndUpdateConfig):
             and ec_transfer_config.is_ec_transfer_instance
         ):
             invalid_reasons.append("KV and EC connectors are not supported")
-        if scheduler_config.async_scheduling is not False:
-            invalid_reasons.append("--no-async-scheduling must be set")
         if scheduler_config.max_num_batched_tokens < 64:
             invalid_reasons.append("max_num_batched_tokens must be at least 64")
 

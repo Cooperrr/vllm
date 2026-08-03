@@ -44,12 +44,14 @@ from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 pytestmark = pytest.mark.cpu_test
 
 
+@pytest.mark.parametrize("async_scheduling", [False, True])
 def test_qwen_gdn_batch_invariant_prefill_uses_fixed_chunks(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, async_scheduling: bool
 ):
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
     monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
     scheduler = create_scheduler(
+        async_scheduling=async_scheduling,
         max_num_batched_tokens=100,
         max_model_len=256,
         kv_cache_spec=MambaSpec(
@@ -63,33 +65,27 @@ def test_qwen_gdn_batch_invariant_prefill_uses_fixed_chunks(
     [request] = create_requests(num_requests=1, num_tokens=200)
     scheduler.add_request(request)
 
+    def empty_model_output() -> ModelRunnerOutput:
+        return ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        )
+
     first = scheduler.schedule()
     assert first.num_scheduled_tokens[request.request_id] == 64
-    scheduler.update_from_output(
-        first,
-        ModelRunnerOutput(
-            req_ids=[request.request_id],
-            req_id_to_index={request.request_id: 0},
-            sampled_token_ids=[[]],
-            logprobs=None,
-            prompt_logprobs_dict={},
-            pooler_output=[],
-        ),
-    )
 
-    second = scheduler.schedule()
+    if async_scheduling:
+        second = scheduler.schedule()
+        scheduler.update_from_output(first, empty_model_output())
+    else:
+        scheduler.update_from_output(first, empty_model_output())
+        second = scheduler.schedule()
     assert second.num_scheduled_tokens[request.request_id] == 64
-    scheduler.update_from_output(
-        second,
-        ModelRunnerOutput(
-            req_ids=[request.request_id],
-            req_id_to_index={request.request_id: 0},
-            sampled_token_ids=[[]],
-            logprobs=None,
-            prompt_logprobs_dict={},
-            pooler_output=[],
-        ),
-    )
+    scheduler.update_from_output(second, empty_model_output())
 
     final = scheduler.schedule()
     assert final.num_scheduled_tokens[request.request_id] == 72
