@@ -40,11 +40,11 @@ import vllm.envs as envs
 from vllm.platforms import current_platform
 
 if not current_platform.is_cuda() or not (
-    any(current_platform.is_device_capability(cap) for cap in (86, 89, 90))
+    any(current_platform.is_device_capability(cap) for cap in (86, 89, 90, 120))
     or current_platform.is_device_capability_family(100)
 ):
     pytest.skip(
-        reason="GDN _forward_core split tests require CUDA SM86/89/90/10x.",
+        reason="GDN _forward_core split tests require CUDA SM86/89/90/10x/120.",
         allow_module_level=True,
     )
 
