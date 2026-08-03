@@ -51,6 +51,7 @@ def _qwen_gdn_batch_invariant_config() -> SimpleNamespace:
             quantization_config=None,
             is_quantized=False,
             hf_text_config=SimpleNamespace(quantization_config=None),
+            model_arch_config=SimpleNamespace(quantization_config=None),
             multimodal_config=SimpleNamespace(language_model_only=True),
         ),
         cache_config=SimpleNamespace(
@@ -80,6 +81,23 @@ def test_qwen_gdn_batch_invariant_profile_accepts_supported_config(dtype):
     Qwen3_5ForConditionalGenerationConfig._verify_batch_invariant_profile(config)
 
 
+def test_qwen_gdn_batch_invariant_profile_accepts_compressed_tensors_fp8(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    config = _qwen_gdn_batch_invariant_config()
+    config.model_config.quantization = "compressed-tensors"
+    config.model_config.is_quantized = True
+    config.model_config.model_arch_config.quantization_config = {
+        "format": "float-quantized",
+        "kv_cache_scheme": None,
+        "sparsity_config": {},
+        "transform_config": {},
+    }
+
+    Qwen3_5ForConditionalGenerationConfig._verify_batch_invariant_profile(config)
+
+
 def test_qwen_gdn_batch_invariant_profile_reports_all_violations():
     config = _qwen_gdn_batch_invariant_config()
     config.model_config.dtype = torch.float32
@@ -101,7 +119,7 @@ def test_qwen_gdn_batch_invariant_profile_reports_all_violations():
     message = str(exc_info.value)
     expected_reasons = (
         "dtype must be bfloat16 or float16",
-        "quantized weights are not supported",
+        "quantized weights must use compressed-tensors FP8",
         "--language-model-only must be enabled",
         "tensor parallel size must be 1",
         "pipeline parallel size must be 1",

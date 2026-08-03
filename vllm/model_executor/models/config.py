@@ -6,6 +6,7 @@ import torch
 
 from vllm import envs
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.utils.math_utils import round_up
 
 if TYPE_CHECKING:
@@ -746,6 +747,26 @@ class Qwen3VLForSequenceClassificationConfig(Qwen3ForSequenceClassificationConfi
 
 class Qwen3_5ForConditionalGenerationConfig(VerifyAndUpdateConfig):
     @staticmethod
+    def _supports_batch_invariant_quantization(model_config: "ModelConfig") -> bool:
+        if (
+            not current_platform.is_cuda()
+            or model_config.quantization != "compressed-tensors"
+            or model_config.quantization_config is not None
+        ):
+            return False
+
+        quantization_config = getattr(
+            model_config.model_arch_config, "quantization_config", None
+        )
+        return (
+            isinstance(quantization_config, dict)
+            and quantization_config.get("format") == "float-quantized"
+            and quantization_config.get("kv_cache_scheme") is None
+            and not quantization_config.get("transform_config")
+            and not quantization_config.get("sparsity_config")
+        )
+
+    @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
         """Update mamba_ssm_cache_dtype for Qwen3.5 models when set to 'auto'
         (or not explicitly set), to the value specified in the HF config's
@@ -786,14 +807,19 @@ class Qwen3_5ForConditionalGenerationConfig(VerifyAndUpdateConfig):
 
         if model_config.dtype not in (torch.bfloat16, torch.float16):
             invalid_reasons.append("dtype must be bfloat16 or float16")
-        if (
+        has_quantized_weights = (
             model_config.quantization is not None
             or model_config.quantization_config is not None
             or model_config.is_quantized
             or getattr(model_config.hf_text_config, "quantization_config", None)
             is not None
-        ):
-            invalid_reasons.append("quantized weights are not supported")
+        )
+        profile = Qwen3_5ForConditionalGenerationConfig
+        quantization_supported = profile._supports_batch_invariant_quantization(
+            model_config
+        )
+        if has_quantized_weights and not quantization_supported:
+            invalid_reasons.append("quantized weights must use compressed-tensors FP8")
 
         multimodal_config = model_config.multimodal_config
         if multimodal_config is None or not multimodal_config.language_model_only:
