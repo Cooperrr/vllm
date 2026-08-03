@@ -43,7 +43,14 @@ def test_only_dense_qwen_gdn_uses_batch_invariant_backend(model_type, expected):
 
 @pytest.mark.parametrize(
     ("capability", "expected"),
-    [(80, False), (86, True), (89, True), (90, True), (100, False)],
+    [
+        (80, False),
+        (86, True),
+        (89, True),
+        (90, True),
+        (100, False),
+        (120, True),
+    ],
 )
 def test_qwen_gdn_batch_invariance_capability_gate(
     monkeypatch: pytest.MonkeyPatch,

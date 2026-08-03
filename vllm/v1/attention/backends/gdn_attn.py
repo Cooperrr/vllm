@@ -50,10 +50,9 @@ class QwenGDNAttentionBackend(GDNAttentionBackend):
     def supports_batch_invariance(cls) -> bool:
         from vllm.platforms import current_platform
 
-        # TODO-AMPHERE-OVERRIDE: Remove SM86 after local development validation.
         return current_platform.is_cuda() and any(
             current_platform.is_device_capability(capability)
-            for capability in (86, 89, 90)
+            for capability in (86, 89, 90, 120)
         )
 
 
