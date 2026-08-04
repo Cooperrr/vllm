@@ -967,9 +967,6 @@ def override_envs_for_invariance():
     os.environ["NCCL_NTHREADS"] = "1"
     os.environ["NCCL_SOCKET_NTHREADS"] = "1"
 
-    # torch.compile settings
-    os.environ["VLLM_USE_AOT_COMPILE"] = "0"
-
 
 def init_batch_invariance():
     # this will hit all the csrc overrides as well
