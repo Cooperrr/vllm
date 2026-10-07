@@ -1423,6 +1423,56 @@ def test_hybrid_cache_integration(default_vllm_config, dist_init):
     assert _is_req_state_block_table_match(runner, req_id)
 
 
+@pytest.mark.parametrize("batch_invariant", [False, True])
+@pytest.mark.parametrize("prefilling", [False, True])
+@pytest.mark.parametrize("capture", [False, True])
+def test_qwen_gdn_prompt_suffix_avoids_decode_graph(
+    monkeypatch, batch_invariant, prefilling, capture
+):
+    monkeypatch.setattr(
+        gpu_model_runner_module.envs, "VLLM_BATCH_INVARIANT", batch_invariant
+    )
+    dispatcher = Mock()
+    dispatcher.dispatch.return_value = (
+        gpu_model_runner_module.CUDAGraphMode.NONE,
+        SimpleNamespace(num_tokens=1),
+    )
+    runner = SimpleNamespace(
+        _is_uniform_decode=GPUModelRunner._is_uniform_decode,
+        uniform_decode_query_len=1,
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(model_type="qwen3_5_text"),
+            is_encoder_decoder=False,
+        ),
+        input_batch=SimpleNamespace(
+            num_computed_tokens_cpu=np.array([64]),
+            num_prompt_tokens=np.array([65 if prefilling else 64]),
+            lora_id_to_lora_request={},
+        ),
+        _pad_for_sequence_parallelism=lambda n: n,
+        cudagraph_dispatcher=dispatcher,
+        compilation_config=SimpleNamespace(
+            pass_config=SimpleNamespace(enable_sp=False)
+        ),
+        vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(data_parallel_size=1),
+            observability_config=SimpleNamespace(cudagraph_metrics=False),
+        ),
+    )
+    GPUModelRunner._determine_batch_execution_and_padding(
+        runner,
+        num_tokens=1,
+        num_reqs=1,
+        num_scheduled_tokens_np=np.array([1]),
+        max_num_scheduled_tokens=1,
+        use_cascade_attn=False,
+        force_uniform_decode=True if capture else None,
+    )
+    assert dispatcher.dispatch.call_args.kwargs["uniform_decode"] == (
+        capture or not (batch_invariant and prefilling)
+    )
+
+
 def test_is_uniform_decode() -> None:
     # Normal
     assert GPUModelRunner._is_uniform_decode(

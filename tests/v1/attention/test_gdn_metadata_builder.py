@@ -10,6 +10,7 @@ from dataclasses import dataclass
 import pytest
 import torch
 
+import vllm.envs as envs
 from tests.v1.attention.utils import (
     BatchSpec,
     create_common_attn_metadata,
@@ -24,6 +25,30 @@ from vllm.v1.kv_cache_interface import MambaSpec
 
 BLOCK_SIZE = 16
 DEVICE = torch.device("cpu")
+
+
+@pytest.mark.parametrize("batch_invariant", [False, True])
+@pytest.mark.parametrize("mixed", [False, True])
+def test_gdn_one_token_prompt_suffix_stays_prefill(monkeypatch, batch_invariant, mixed):
+    builder = _create_gdn_builder()
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", batch_invariant)
+    batch = BatchSpec(
+        seq_lens=[80, 65, 90] if mixed else [65],
+        query_lens=[1, 1, 26] if mixed else [1],
+    )
+    common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE).replace(
+        is_prefilling=torch.tensor([False, True, True] if mixed else [True])
+    )
+    metadata = builder.build(0, common)
+
+    expected_decodes = (1 if mixed else 0) + (not batch_invariant)
+    assert metadata.num_decodes == expected_decodes
+    assert metadata.num_prefills == batch.batch_size - expected_decodes
+    if batch_invariant:
+        assert metadata.prefill_query_start_loc.tolist() == (
+            [0, 1, 27] if mixed else [0, 1]
+        )
+        assert metadata.prefill_has_initial_state.all()
 
 
 @dataclass
@@ -125,7 +150,9 @@ def _create_gdn_builder(
     num_speculative_tokens: int = 0,
 ) -> GDNAttentionMetadataBuilder:
     """Create a GDNAttentionMetadataBuilder with minimal config."""
-    vllm_config = create_vllm_config(block_size=BLOCK_SIZE)
+    # Only generic engine settings are used; no weights or gated model access
+    # are needed for metadata classification.
+    vllm_config = create_vllm_config(model_name="gpt2", block_size=BLOCK_SIZE)
     if num_speculative_tokens > 0:
         vllm_config.speculative_config = SpeculativeConfig(
             method="ngram",

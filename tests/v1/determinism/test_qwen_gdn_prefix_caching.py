@@ -9,6 +9,7 @@ import json
 import math
 import os
 import random
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,7 @@ from tests.utils import create_new_process_for_each_test
 from vllm import SamplingParams, TokensPrompt
 from vllm.outputs import RequestOutput
 from vllm.v1.attention.backends.gdn_attn import QwenGDNAttentionBackend
+from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 
 pytestmark = [
     pytest.mark.skipif(
@@ -28,6 +30,28 @@ pytestmark = [
     ),
     pytest.mark.timeout(1800),
 ]
+
+
+def _worker_cache_layout(worker) -> dict:
+    """Read finalized allocation from the worker, not the frontend's config copy."""
+    specs = worker.get_kv_cache_spec().values()
+    mamba = next(spec for spec in specs if isinstance(spec, MambaSpec))
+    attention = next(spec for spec in specs if isinstance(spec, FullAttentionSpec))
+    return {
+        "mamba_block_size": mamba.block_size,
+        "mamba_page_size_padded": mamba.page_size_padded,
+        "mamba_page_size_bytes": mamba.page_size_bytes,
+        "mamba_unpadded_page_size_bytes": replace(
+            mamba, page_size_padded=None
+        ).page_size_bytes,
+        "attention_block_size": attention.block_size,
+        "attention_page_size_bytes": attention.page_size_bytes,
+    }
+
+
+class PrefixCacheWorkerExtension:
+    def prefix_cache_layout(self) -> dict:
+        return _worker_cache_layout(self)
 
 
 def _snapshot(output: RequestOutput) -> dict:
@@ -62,6 +86,9 @@ def _prompts(tokenizer, block_size: int, token_budget: int) -> dict[str, list[in
         "block_minus1": block_size - 1,
         "block_exact": block_size,
         "block_plus1": block_size + 1,
+        "block_plus63": block_size + 63,
+        "block_plus64": block_size + 64,
+        "block_plus65": block_size + 65,
         "two_blocks_minus1": 2 * block_size - 1,
         "two_blocks_exact": 2 * block_size,
         "two_blocks_plus1": 2 * block_size + 1,
@@ -69,7 +96,18 @@ def _prompts(tokenizer, block_size: int, token_budget: int) -> dict[str, list[in
         "chunk_exact": token_budget + 64,
         "chunk_plus1": token_budget + 65,
     }
-    words = "report bank rules records review policy market risk customer annual".split()
+    words = [
+        "report",
+        "bank",
+        "rules",
+        "records",
+        "review",
+        "policy",
+        "market",
+        "risk",
+        "customer",
+        "annual",
+    ]
     prompts = {}
     for index, (name, length) in enumerate(lengths.items()):
         rng = random.Random(3407 + index)
@@ -93,8 +131,10 @@ def test_qwen_gdn_prefix_cache_exactness(
     assert envs.VLLM_BATCH_INVARIANT
     model = os.getenv("VLLM_TEST_MODEL", "Qwen/Qwen3.5-0.8B")
     token_budget = int(os.getenv("VLLM_GDN_TEST_TOKEN_BUDGET", "2048"))
-    assert 128 <= token_budget <= 3072, "Use a token budget in [128, 3072]"
-    model_len = 8192
+    assert token_budget >= 128, "Use a token budget of at least 128"
+    model_len = int(
+        os.getenv("VLLM_GDN_TEST_MAX_MODEL_LEN", str(max(8192, token_budget + 4096)))
+    )
     generation_tokens = 32
     settings = dict(
         dtype="bfloat16",
@@ -109,10 +149,22 @@ def test_qwen_gdn_prefix_cache_exactness(
         async_scheduling=async_scheduling,
         attention_config={"backend": "FLASH_ATTN"},
         additional_config={"gdn_prefill_backend": "triton"},
-        gpu_memory_utilization=float(
-            os.getenv("VLLM_GPU_MEMORY_UTILIZATION", "0.65")
-        ),
+        # Cache-off/on engines compile separately. Fix their reduction choices
+        # so this comparison isolates prefix reuse rather than autotuning.
+        # This is a test control, not a production default.
+        compilation_config={
+            "cudagraph_capture_sizes": [4],
+            "inductor_compile_config": {
+                "deterministic": True,
+                "benchmark_combo_kernel": False,
+            },
+        },
+        gpu_memory_utilization=float(os.getenv("VLLM_GPU_MEMORY_UTILIZATION", "0.65")),
         seed=3407,
+        worker_extension_cls=(
+            "tests.v1.determinism.test_qwen_gdn_prefix_caching."
+            "PrefixCacheWorkerExtension"
+        ),
     )
     sampling = SamplingParams(
         temperature=0.0,
@@ -183,13 +235,14 @@ def test_qwen_gdn_prefix_cache_exactness(
                     failures.append(f"{label}/{name}: {field} differ at step {first}")
         checkpoint()
 
-    def check_hits(snapshots, names_with_hits, label):
+    def check_hits(snapshots, names_with_hits, label, optional_hits=()):
         for name, snapshot in snapshots.items():
             hits = snapshot["num_cached_tokens"]
             check(isinstance(hits, int), f"{label}/{name}: missing cache-hit counter")
             if isinstance(hits, int):
                 if name in names_with_hits:
                     check(hits > 0, f"{label}/{name}: expected a real prefix-cache hit")
+                if hits > 0:
                     check(
                         hits <= (len(prompts[name]) - 1) // block_size * block_size,
                         f"{label}/{name}: invalid hit length {hits}",
@@ -198,23 +251,37 @@ def test_qwen_gdn_prefix_cache_exactness(
                         hits % block_size == 0,
                         f"{label}/{name}: unaligned hit length {hits}",
                     )
-                else:
+                if name not in names_with_hits and name not in optional_hits:
                     check(hits == 0, f"{label}/{name}: unexpected cache hit {hits}")
+                check(hits >= 0, f"{label}/{name}: negative hit length {hits}")
         checkpoint()
 
     def describe(llm):
         config = llm.llm_engine.vllm_config
         assert config.model_config.hf_text_config.model_type == "qwen3_5_text"
         cache = config.cache_config
+        [layout] = llm.collective_rpc("prefix_cache_layout")
+        assert layout["attention_block_size"] == cache.block_size
+        assert layout["mamba_page_size_bytes"] == layout["attention_page_size_bytes"]
+        assert (
+            layout["mamba_page_size_bytes"] >= layout["mamba_unpadded_page_size_bytes"]
+        )
+        if cache.enable_prefix_caching:
+            assert layout["mamba_block_size"] == cache.block_size
         report["engines"].append(
             {
                 "prefix_caching": cache.enable_prefix_caching,
                 "block_size": cache.block_size,
+                **layout,
                 "mamba_cache_mode": cache.mamba_cache_mode,
                 "mamba_ssm_cache_dtype": cache.mamba_ssm_cache_dtype,
                 "compilation_mode": str(config.compilation_config.mode),
                 "cudagraph_mode": str(config.compilation_config.cudagraph_mode),
                 "async_scheduling": config.scheduler_config.async_scheduling,
+                "inductor_compile_config": {
+                    key: config.compilation_config.inductor_compile_config.get(key)
+                    for key in ("deterministic", "benchmark_combo_kernel")
+                },
             }
         )
         checkpoint()
@@ -229,6 +296,7 @@ def test_qwen_gdn_prefix_cache_exactness(
         cache = describe(llm)
         block_size = cache.block_size
         assert block_size is not None and block_size >= 64
+        assert block_size % 64 == 0, "Cache boundaries must preserve GDN chunks"
         assert block_size <= token_budget, (
             f"Cache block {block_size} exceeds budget {token_budget}; "
             "increase VLLM_GDN_TEST_TOKEN_BUDGET"
@@ -262,10 +330,20 @@ def test_qwen_gdn_prefix_cache_exactness(
             check_hits(cold, set(), "cold-solo")
             compare(cold, reference, "cold-solo")
             warm = generate(llm, [name], prompts, "warm-solo")
-            expected_hits = {name} if len(prompts[name]) > block_size else set()
-            check_hits(warm, expected_hits, "warm-solo")
+            length = len(prompts[name])
+            # Align mode only saves states at scheduled boundaries. If a prompt
+            # ends exactly on a block boundary, that final state cannot be reused
+            # for the same prompt (its last token must run to obtain logits).
+            # An earlier state may exist if the prefill needed several steps.
+            expected_hits = (
+                {name} if length > block_size and length % block_size else set()
+            )
+            optional_hits = (
+                {name} if length > block_size and not length % block_size else set()
+            )
+            check_hits(warm, expected_hits, "warm-solo", optional_hits)
             compare(warm, reference, "warm-solo")
-            if expected_hits:
+            if length > block_size:
                 assert llm.reset_prefix_cache()
                 # Ending the donor exactly at a block boundary makes that state
                 # available even in 'align' mode, which does not save every block.
@@ -288,19 +366,19 @@ def test_qwen_gdn_prefix_cache_exactness(
             cold = generate(llm, names, prompts, label)
             check_hits(cold, set(), label)
             compare(cold, reference, label)
-            assert llm.reset_prefix_cache()
-            # Warm just one request: the batch contains a real hit alongside
-            # fresh short and long requests, exercising mixed decode/prefill.
-            needle = "chunk_plus1"
-            llm.generate(
-                [TokensPrompt(prompt_token_ids=prompts[needle][:block_size])],
-                donor_sampling,
-                use_tqdm=False,
-            )
-            label = f"partial-mixed-{order}"
-            mixed = generate(llm, names, prompts, label)
-            check_hits(mixed, {needle}, label)
-            compare(mixed, reference, label)
+            # Include both a long remaining prefill and a single prompt token
+            # after a real cache hit, alongside fresh short and long requests.
+            for needle in ("chunk_plus1", "block_plus1"):
+                assert llm.reset_prefix_cache()
+                llm.generate(
+                    [TokensPrompt(prompt_token_ids=prompts[needle][:block_size])],
+                    donor_sampling,
+                    use_tqdm=False,
+                )
+                label = f"partial-mixed-{order}-{needle}"
+                mixed = generate(llm, names, prompts, label)
+                check_hits(mixed, {needle}, label)
+                compare(mixed, reference, label)
 
         assert llm.reset_prefix_cache()
         reset = generate(llm, ["chunk_plus1"], prompts, "after-reset")

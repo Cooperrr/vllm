@@ -115,14 +115,14 @@ def test_qwen_gdn_prefill_alignment_is_batch_invariant_only(
 
 
 @pytest.mark.parametrize("async_scheduling", [False, True])
-@pytest.mark.parametrize("block_size", [64, 80])
+@pytest.mark.parametrize("block_size", [64, 576])
 def test_qwen_gdn_prefill_preserves_prefix_cache_boundaries(
     monkeypatch: pytest.MonkeyPatch, async_scheduling: bool, block_size: int
 ):
     """Use cache boundaries, including the final short prefill, without stalling.
 
-    This tests scheduler progress only. GPU tests separately check whether
-    restoring these states preserves exact outputs, including non-64 boundaries.
+    This tests scheduler progress at chunk-aligned cache boundaries. Platform
+    tests check page-size rounding; GPU tests check exact restored outputs.
     """
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
     monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
