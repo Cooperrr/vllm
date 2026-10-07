@@ -3797,6 +3797,20 @@ class GPUModelRunner(
             num_reqs=num_reqs,
             force_uniform_decode=force_uniform_decode,
         )
+        if (
+            uniform_decode
+            and force_uniform_decode is None
+            and envs.VLLM_BATCH_INVARIANT
+            and self.model_config.hf_text_config.model_type == "qwen3_5_text"
+            and np.any(
+                self.input_batch.num_computed_tokens_cpu[:num_reqs]
+                < self.input_batch.num_prompt_tokens[:num_reqs]
+            )
+        ):
+            # A one-token prompt suffix uses GDN's chunk prefill kernel, not
+            # its recurrent decode kernel. Do not replay a full decode graph
+            # for it; piecewise graphs still cover the surrounding model.
+            uniform_decode = False
         # Encoder-decoder models only support CG for decoder_step > 0 (no enc_output
         # is present). Also, chunked-prefill is disabled, so batch are uniform.
         has_encoder_output = (
