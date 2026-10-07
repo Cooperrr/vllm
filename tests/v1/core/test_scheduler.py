@@ -114,21 +114,51 @@ def test_qwen_gdn_prefill_alignment_is_batch_invariant_only(
     assert output.num_scheduled_tokens[request.request_id] == 100
 
 
-def test_qwen_gdn_prefill_alignment_rejects_mamba_alignment(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize("block_size", [64, 80])
+def test_qwen_gdn_prefill_preserves_prefix_cache_boundaries(
+    monkeypatch: pytest.MonkeyPatch, async_scheduling: bool, block_size: int
 ):
-    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    """Use cache boundaries, including the final short prefill, without stalling.
 
-    with pytest.raises(ValueError, match="mutually exclusive"):
-        create_scheduler(
-            kv_cache_spec=MambaSpec(
-                block_size=16,
-                shapes=((1, 1),),
-                dtypes=(torch.float32,),
-                mamba_type=MambaAttentionBackendEnum.QWEN_GDN_ATTN,
-                mamba_cache_mode="align",
-            ),
+    This tests scheduler progress only. GPU tests separately check whether
+    restoring these states preserves exact outputs, including non-64 boundaries.
+    """
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    scheduler = create_scheduler(
+        async_scheduling=async_scheduling,
+        enable_prefix_caching=True,
+        block_size=block_size,
+        max_num_batched_tokens=2 * block_size + 17,
+        max_model_len=4 * block_size,
+        kv_cache_spec=MambaSpec(
+            block_size=block_size,
+            shapes=((1, 1),),
+            dtypes=(torch.float32,),
+            mamba_type=MambaAttentionBackendEnum.QWEN_GDN_ATTN,
             mamba_cache_mode="align",
+        ),
+        mamba_cache_mode="align",
+    )
+    [request] = create_requests(
+        num_requests=1, num_tokens=3 * block_size + 7, block_size=block_size
+    )
+    scheduler.add_request(request)
+
+    for expected_tokens in (2 * block_size, block_size, 7):
+        output = scheduler.schedule()
+        assert output.num_scheduled_tokens[request.request_id] == expected_tokens
+        scheduler.update_from_output(
+            output,
+            ModelRunnerOutput(
+                req_ids=[request.request_id],
+                req_id_to_index={request.request_id: 0},
+                sampled_token_ids=[[]],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
         )
 
 

@@ -76,12 +76,15 @@ def _qwen_gdn_batch_invariant_config() -> SimpleNamespace:
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("async_scheduling", [False, True, None])
+@pytest.mark.parametrize("prefix_caching", [False, True])
 def test_qwen_gdn_batch_invariant_profile_accepts_supported_config(
-    dtype, async_scheduling
+    dtype, async_scheduling, prefix_caching
 ):
     config = _qwen_gdn_batch_invariant_config()
     config.model_config.dtype = dtype
     config.scheduler_config.async_scheduling = async_scheduling
+    config.cache_config.enable_prefix_caching = prefix_caching
+    config.cache_config.mamba_cache_mode = "align" if prefix_caching else "none"
 
     Qwen3_5ForConditionalGenerationConfig._verify_batch_invariant_profile(config)
 
@@ -143,8 +146,6 @@ def test_qwen_gdn_batch_invariant_profile_reports_all_violations():
     config.parallel_config.pipeline_parallel_size = 2
     config.lora_config = object()
     config.speculative_config = object()
-    config.cache_config.enable_prefix_caching = True
-    config.cache_config.mamba_cache_mode = "align"
     config.kv_transfer_config = SimpleNamespace(is_kv_transfer_instance=True)
     config.scheduler_config.max_num_batched_tokens = 63
     config.scheduler_config.max_num_scheduled_tokens = 63
@@ -162,8 +163,6 @@ def test_qwen_gdn_batch_invariant_profile_reports_all_violations():
         "pipeline parallel size must be 1",
         "LoRA adapters are not supported",
         "speculative decoding is not supported",
-        "prefix caching must be disabled",
-        "mamba cache mode must be 'none'",
         "KV and EC connectors are not supported",
         "max_num_batched_tokens must be at least 64",
         "max_num_scheduled_tokens must be at least 64 when set",

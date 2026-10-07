@@ -590,9 +590,8 @@ class Qwen3_5ForConditionalGenerationConfig(VerifyAndUpdateConfig):
 
     @staticmethod
     def _verify_batch_invariant_profile(vllm_config: "VllmConfig") -> None:
-        """Validate the currently tested dense Qwen GDN configuration."""
+        """Validate the dense Qwen GDN batch-invariance configuration."""
         model_config = vllm_config.model_config
-        cache_config = vllm_config.cache_config
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config
         invalid_reasons: list[str] = []
@@ -624,10 +623,6 @@ class Qwen3_5ForConditionalGenerationConfig(VerifyAndUpdateConfig):
             invalid_reasons.append("LoRA adapters are not supported")
         if vllm_config.speculative_config is not None:
             invalid_reasons.append("speculative decoding is not supported")
-        if cache_config.enable_prefix_caching:
-            invalid_reasons.append("prefix caching must be disabled")
-        if cache_config.mamba_cache_mode != "none":
-            invalid_reasons.append("mamba cache mode must be 'none'")
 
         kv_transfer_config = vllm_config.kv_transfer_config
         ec_transfer_config = vllm_config.ec_transfer_config
