@@ -42,6 +42,51 @@ from vllm.platforms import current_platform
 DEVICE_TYPE = current_platform.device_type
 
 
+@pytest.mark.parametrize(
+    "cache_mode,batched_tokens,scheduled_tokens,error_limit",
+    [
+        ("align", 2048, 0, "max_num_scheduled_tokens"),
+        ("align", 2048, 128, "max_num_scheduled_tokens"),
+        ("align", 2048, 575, "max_num_scheduled_tokens"),
+        ("align", 2048, 576, None),
+        ("align", 2048, 577, None),
+        ("align", 2048, 2048, None),
+        ("align", 2048, None, None),
+        ("align", 575, None, "max_num_batched_tokens"),
+        ("align", 576, None, None),
+        ("align", 575, 576, "max_num_batched_tokens"),
+        ("none", 2048, 128, None),
+        ("all", 2048, 128, None),
+    ],
+)
+def test_mamba_align_block_size_validates_token_budgets(
+    monkeypatch, cache_mode, batched_tokens, scheduled_tokens, error_limit
+):
+    monkeypatch.setattr(envs, "VLLM_USE_V2_MODEL_RUNNER", False)
+    # Validate the finalized hybrid block size, which can exceed the requested
+    # attention block size after Mamba page alignment.
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=576, mamba_cache_mode=cache_mode),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        scheduler_config=SimpleNamespace(
+            max_num_batched_tokens=batched_tokens,
+            max_num_scheduled_tokens=scheduled_tokens,
+            long_prefill_token_threshold=0,
+            disable_chunked_mm_input=False,
+        ),
+    )
+
+    if error_limit is not None:
+        limit = getattr(config.scheduler_config, error_limit)
+        with pytest.raises(
+            AssertionError,
+            match=rf"block_size \(576\) must be <= {error_limit} \({limit}\)",
+        ):
+            VllmConfig.validate_block_size(config)
+    else:
+        VllmConfig.validate_block_size(config)
+
+
 def _qwen_gdn_batch_invariant_config() -> SimpleNamespace:
     return SimpleNamespace(
         model_config=SimpleNamespace(
