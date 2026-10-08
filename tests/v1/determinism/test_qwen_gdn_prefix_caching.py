@@ -2,7 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Exact cache-hit comparisons for dense Qwen3.5, sized for one RTX 3090.
 
-See qwen_gdn_prefix_caching.md for setup, commands and validation limits.
+Compare token IDs, logprobs, and ranks across uncached, cold, and cached runs.
+Requires a CUDA-enabled vLLM environment. Defaults to Qwen/Qwen3.5-0.8B;
+VLLM_TEST_MODEL overrides the checkpoint. See _engine_settings for the other
+test settings and environment overrides. Reports and scheduler traces are
+written to pytest's temporary directory.
 """
 
 import json
