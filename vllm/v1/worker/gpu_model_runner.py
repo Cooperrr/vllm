@@ -2202,6 +2202,7 @@ class GPUModelRunner(
         num_scheduled_tokens: dict[str, int] | None = None,
         cascade_attn_prefix_lens: list[list[int]] | None = None,
         slot_mappings: dict[int, torch.Tensor] | None = None,
+        is_prefilling: torch.Tensor | None = None,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         Returns:
@@ -2267,16 +2268,18 @@ class GPUModelRunner(
         num_computed_tokens_cpu = self.input_batch.num_computed_tokens_cpu_tensor[
             :num_reqs_padded
         ]
-        num_prompt_tokens_cpu = self.input_batch.num_prompt_tokens_cpu_tensor[
-            :num_reqs_padded
-        ]
         seq_lens_cpu = self.optimistic_seq_lens_cpu[:num_reqs_padded]
         seq_lens_cpu_upper_bound = seq_lens_cpu
 
         # is_prefilling: True if request is still in prefill phase.
         # Used by mamba backends to distinguish actual decodes from
         # short extends.
-        is_prefilling = num_computed_tokens_cpu < num_prompt_tokens_cpu
+        # Dummy runs supply their own flags instead of using live batch rows.
+        if is_prefilling is None:
+            num_prompt_tokens_cpu = self.input_batch.num_prompt_tokens_cpu_tensor[
+                :num_reqs_padded
+            ]
+            is_prefilling = num_computed_tokens_cpu < num_prompt_tokens_cpu
         # Zero out padded rows so stale data from condense() doesn't
         # misclassify padding as prefill in CUDA graph mode.
         is_prefilling[num_reqs:] = False
@@ -5828,6 +5831,9 @@ class GPUModelRunner(
                     for_cudagraph_capture=is_graph_capturing,
                     slot_mappings=slot_mappings_by_group,
                     use_spec_decode=self.speculative_config is not None,
+                    is_prefilling=torch.zeros(
+                        num_reqs_padded, dtype=torch.bool, device="cpu"
+                    ),
                 )
 
         with self.maybe_dummy_run_with_lora(
