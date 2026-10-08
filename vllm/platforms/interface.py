@@ -538,6 +538,7 @@ class Platform:
         """
         from math import lcm
 
+        from vllm import envs
         from vllm.config.vllm import set_current_vllm_config
         from vllm.model_executor.models import ModelRegistry
         from vllm.utils.math_utils import cdiv
@@ -645,6 +646,15 @@ class Platform:
                 ),
                 cache_config.block_size,
             )
+
+        if (
+            envs.VLLM_BATCH_INVARIANT
+            and model_config.hf_text_config.model_type == "qwen3_5_text"
+        ):
+            # Restoring a GDN state must preserve the 64-token prefill chunk
+            # grid. Page-size compatibility alone can choose e.g. 544 tokens,
+            # which splits a chunk and changes floating-point accumulation.
+            kernel_block_alignment_size = lcm(kernel_block_alignment_size, 64)
 
         if cache_config.mamba_cache_mode == "all":
             # With prefix caching, align to mamba chunk size for kernel perf

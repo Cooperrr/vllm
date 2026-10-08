@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
 
+from vllm import envs
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
@@ -131,6 +132,9 @@ class KVCacheManager:
             max_num_batched_tokens = max_model_len
 
         self.enable_caching = enable_caching
+        self.cache_prompt_only = (
+            envs.VLLM_BATCH_INVARIANT and kv_cache_config.has_qwen_gdn_layers
+        )
         self.use_eagle = use_eagle
         self.log_stats = log_stats
         self.metrics_collector = metrics_collector
@@ -213,12 +217,17 @@ class KVCacheManager:
             return self.empty_kv_cache_blocks, 0
 
         # NOTE: When all tokens hit the cache, we must recompute the last token
-        # to obtain logits. Thus, set max_cache_hit_length to prompt_length - 1.
+        # to obtain logits. Thus, leave at least one token to compute.
         # This can trigger recomputation of an entire block, rather than just
         # the single last token, because allocate_slots() requires
         # num_computed_tokens to be block-size aligned. Removing this limitation
         # could slightly improve performance in the future.
         max_cache_hit_length = request.num_tokens - 1
+        if self.cache_prompt_only:
+            # Another request may have cached our generated tokens as prefill.
+            # On resume, those tokens must instead replay through recurrent
+            # decode, so cache reads must stop at our original prompt boundary.
+            max_cache_hit_length = min(max_cache_hit_length, request.num_prompt_tokens)
         computed_blocks, num_new_computed_tokens = (
             self.coordinator.find_longest_cache_hit(
                 request.block_hashes, max_cache_hit_length
@@ -431,7 +440,7 @@ class KVCacheManager:
             total_computed_tokens + num_new_tokens,
             request.num_tokens,
         )
-        self.coordinator.cache_blocks(request, num_tokens_to_cache)
+        self.cache_blocks(request, num_tokens_to_cache)
 
         return self.create_kv_cache_blocks(new_blocks)
 
@@ -559,6 +568,14 @@ class KVCacheManager:
                 that are already cached and tokens to be cached.
         """
         if self.enable_caching:
+            if self.cache_prompt_only:
+                # GDN's recurrent decode and chunked prefill round differently.
+                # Restrict every hybrid cache group: otherwise a later prefill
+                # could pair fresh GDN state with old decode-produced attention
+                # blocks carrying the same token hashes.
+                num_computed_tokens = min(
+                    num_computed_tokens, request.num_prompt_tokens
+                )
             self.coordinator.cache_blocks(request, num_computed_tokens)
 
     def create_kv_cache_blocks(

@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
+from contextlib import nullcontext
 from unittest.mock import Mock
 
 import pytest
 import torch
 
+import vllm.envs as envs
 from vllm.config import (
     CacheConfig,
     ECTransferConfig,
@@ -22,6 +24,7 @@ from vllm.multimodal.inputs import (
 )
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.utils.hashing import sha256
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
@@ -31,6 +34,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+    MambaSpec,
 )
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
@@ -39,6 +43,339 @@ from vllm.v1.structured_output import StructuredOutputManager
 from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 
 pytestmark = pytest.mark.cpu_test
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize("cache_enabled", [False, True])
+@pytest.mark.parametrize("prompt_tokens", [63, 65])
+def test_qwen_gdn_preemption_replays_output_through_decode(
+    monkeypatch, async_scheduling, cache_enabled, prompt_tokens
+):
+    """Rebuild the prompt, then replay output without generating extra tokens."""
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    cache_mode = "align" if cache_enabled else "none"
+    scheduler = create_scheduler(
+        async_scheduling=async_scheduling,
+        enable_prefix_caching=cache_enabled,
+        block_size=64,
+        max_num_batched_tokens=256,
+        max_model_len=512,
+        kv_cache_spec=MambaSpec(
+            block_size=64,
+            shapes=((1, 1),),
+            dtypes=(torch.float32,),
+            mamba_type=MambaAttentionBackendEnum.QWEN_GDN_ATTN,
+            mamba_cache_mode=cache_mode,
+        ),
+        mamba_cache_mode=cache_mode,
+    )
+    [request] = create_requests(
+        num_requests=1, num_tokens=prompt_tokens, block_size=64, max_tokens=100
+    )
+    scheduler.add_request(request)
+
+    def complete_step(output):
+        # Match the runner: partial recomputation discards its sample.
+        scheduler.update_from_output(
+            output,
+            ModelRunnerOutput(
+                req_ids=[request.request_id],
+                req_id_to_index={request.request_id: 0},
+                sampled_token_ids=[[] if request.is_prefill_chunk else [42]],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )
+
+    while request.num_output_tokens < 70:
+        complete_step(scheduler.schedule())
+    saved_output = list(request.output_token_ids)
+    scheduler.running.remove(request)
+    scheduler._preempt_request(request, timestamp=0.0)
+    # A real pressure step leaves the victim out of that step's worker batch.
+    scheduler.prev_step_scheduled_req_ids.discard(request.request_id)
+    assert request.num_computed_tokens == 0
+
+    # Prompt blocks can be reused, but generated blocks must be replayed.
+    cached = scheduler.kv_cache_manager.get_computed_blocks(request)[1]
+    assert cached == (64 if cache_enabled and prompt_tokens == 65 else 0)
+    output = scheduler.schedule()
+    first_count = output.num_scheduled_tokens[request.request_id]
+    assert cached + first_count <= prompt_tokens
+    complete_step(output)
+
+    while request.num_computed_tokens < request.num_tokens:
+        start = request.num_computed_tokens
+        output = scheduler.schedule()
+        count = output.num_scheduled_tokens[request.request_id]
+        if start < prompt_tokens:
+            assert start + count == prompt_tokens
+        else:
+            assert count == 1
+        if request.is_prefill_chunk:
+            assert request.num_output_placeholders == 0
+            complete_step(output)
+            assert list(request.output_token_ids) == saved_output
+        else:
+            assert request.num_computed_tokens == prompt_tokens + len(saved_output)
+            complete_step(output)
+            break
+    assert list(request.output_token_ids) == saved_output + [42]
+    assert request.num_output_placeholders == 0
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_qwen_gdn_batch_invariant_prefill_uses_fixed_chunks(
+    monkeypatch: pytest.MonkeyPatch, async_scheduling: bool
+):
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    scheduler = create_scheduler(
+        async_scheduling=async_scheduling,
+        max_num_batched_tokens=100,
+        max_model_len=256,
+        kv_cache_spec=MambaSpec(
+            block_size=16,
+            shapes=((1, 1),),
+            dtypes=(torch.float32,),
+            mamba_type=MambaAttentionBackendEnum.QWEN_GDN_ATTN,
+            mamba_cache_mode="none",
+        ),
+    )
+    [request] = create_requests(num_requests=1, num_tokens=200)
+    scheduler.add_request(request)
+
+    def empty_model_output() -> ModelRunnerOutput:
+        return ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        )
+
+    first = scheduler.schedule()
+    assert first.num_scheduled_tokens[request.request_id] == 64
+
+    if async_scheduling:
+        second = scheduler.schedule()
+        scheduler.update_from_output(first, empty_model_output())
+    else:
+        scheduler.update_from_output(first, empty_model_output())
+        second = scheduler.schedule()
+    assert second.num_scheduled_tokens[request.request_id] == 64
+    scheduler.update_from_output(second, empty_model_output())
+
+    final = scheduler.schedule()
+    assert final.num_scheduled_tokens[request.request_id] == 72
+
+
+def test_qwen_gdn_prefill_alignment_is_batch_invariant_only(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", False)
+    scheduler = create_scheduler(
+        max_num_batched_tokens=100,
+        max_model_len=256,
+        kv_cache_spec=MambaSpec(
+            block_size=16,
+            shapes=((1, 1),),
+            dtypes=(torch.float32,),
+            mamba_type=MambaAttentionBackendEnum.QWEN_GDN_ATTN,
+            mamba_cache_mode="none",
+        ),
+    )
+    [request] = create_requests(num_requests=1, num_tokens=200)
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens[request.request_id] == 100
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize("block_size", [528, 544])
+@pytest.mark.parametrize(
+    "batch_invariant,mamba_type,cache_mode",
+    [
+        (True, MambaAttentionBackendEnum.QWEN_GDN_ATTN, "align"),
+        (False, MambaAttentionBackendEnum.QWEN_GDN_ATTN, "align"),
+        (True, MambaAttentionBackendEnum.MAMBA2, "align"),
+        (True, MambaAttentionBackendEnum.QWEN_GDN_ATTN, "none"),
+    ],
+)
+def test_qwen_gdn_prefill_rejects_incompatible_cache_boundaries(
+    monkeypatch, async_scheduling, block_size, batch_invariant, mamba_type, cache_mode
+):
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", str(int(batch_invariant)))
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", batch_invariant)
+    needs_both_splits = (
+        batch_invariant
+        and mamba_type == MambaAttentionBackendEnum.QWEN_GDN_ATTN
+        and cache_mode == "align"
+    )
+    expected = (
+        pytest.raises(
+            ValueError,
+            match=rf"Qwen GDN.*block_size \({block_size}\).*multiple of 64",
+        )
+        if needs_both_splits
+        else nullcontext()
+    )
+    with expected:
+        create_scheduler(
+            async_scheduling=async_scheduling,
+            enable_prefix_caching=cache_mode == "align",
+            block_size=block_size,
+            max_num_batched_tokens=2048,
+            kv_cache_spec=MambaSpec(
+                block_size=block_size,
+                shapes=((1, 1),),
+                dtypes=(torch.float32,),
+                mamba_type=mamba_type,
+                mamba_cache_mode=cache_mode,
+            ),
+            mamba_cache_mode=cache_mode,
+        )
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize("block_size", [64, 576])
+def test_qwen_gdn_prefill_preserves_prefix_cache_boundaries(
+    monkeypatch: pytest.MonkeyPatch, async_scheduling: bool, block_size: int
+):
+    """Use cache boundaries, including the final short prefill, without stalling.
+
+    This tests scheduler progress at chunk-aligned cache boundaries. Platform
+    tests check page-size rounding; GPU tests check exact restored outputs.
+    """
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    scheduler = create_scheduler(
+        async_scheduling=async_scheduling,
+        enable_prefix_caching=True,
+        block_size=block_size,
+        max_num_batched_tokens=2 * block_size + 17,
+        max_model_len=4 * block_size,
+        kv_cache_spec=MambaSpec(
+            block_size=block_size,
+            shapes=((1, 1),),
+            dtypes=(torch.float32,),
+            mamba_type=MambaAttentionBackendEnum.QWEN_GDN_ATTN,
+            mamba_cache_mode="align",
+        ),
+        mamba_cache_mode="align",
+    )
+    [request] = create_requests(
+        num_requests=1, num_tokens=3 * block_size + 7, block_size=block_size
+    )
+    scheduler.add_request(request)
+
+    for expected_tokens in (2 * block_size, block_size, 7):
+        output = scheduler.schedule()
+        assert output.num_scheduled_tokens[request.request_id] == expected_tokens
+        scheduler.update_from_output(
+            output,
+            ModelRunnerOutput(
+                req_ids=[request.request_id],
+                req_id_to_index={request.request_id: 0},
+                sampled_token_ids=[[]],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize("batch_invariant", [False, True])
+@pytest.mark.parametrize("suffix_budget", [63, 172, 572])
+def test_qwen_gdn_cached_suffix_split_stays_on_chunk_grid(
+    monkeypatch: pytest.MonkeyPatch,
+    async_scheduling: bool,
+    batch_invariant: bool,
+    suffix_budget: int,
+):
+    """A restored final cache block can still need several prefill steps.
+
+    Reproduce actions_v14's 5756-token prompt with 5184 cached tokens.
+    Cache alignment alone permits a 172/400 split of the remaining 572 tokens;
+    batch invariance also requires intermediate ends on GDN's 64-token grid.
+    """
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", str(int(batch_invariant)))
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", batch_invariant)
+    scheduler = create_scheduler(
+        async_scheduling=async_scheduling,
+        enable_prefix_caching=True,
+        block_size=576,
+        max_num_batched_tokens=8192,
+        max_model_len=8192,
+        kv_cache_spec=MambaSpec(
+            block_size=576,
+            shapes=((1, 1),),
+            dtypes=(torch.float32,),
+            mamba_type=MambaAttentionBackendEnum.QWEN_GDN_ATTN,
+            mamba_cache_mode="align",
+        ),
+        mamba_cache_mode="align",
+    )
+    # The helper uses OPT's 2048-token model config; no model runs in this test.
+    scheduler.max_model_len = 8192
+    donor, target = create_requests(
+        num_requests=2, num_tokens=5756, block_size=576, same_prompt=True
+    )
+
+    def complete_step(output, request):
+        scheduler.update_from_output(
+            output,
+            ModelRunnerOutput(
+                req_ids=[request.request_id],
+                req_id_to_index={request.request_id: 0},
+                sampled_token_ids=[[] if request.is_prefill_chunk else [0]],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )
+
+    scheduler.add_request(donor)
+    for count in (5184, 572):
+        output = scheduler.schedule()
+        assert output.num_scheduled_tokens[donor.request_id] == count
+        complete_step(output, donor)
+    scheduler.finish_requests(donor.request_id, RequestStatus.FINISHED_STOPPED)
+    assert scheduler.kv_cache_manager.get_computed_blocks(target)[1] == 5184
+    scheduler.add_request(target)
+
+    # Simulate the budget left after other requests consume scheduler capacity.
+    scheduler.max_num_scheduled_tokens = suffix_budget
+    output = scheduler.schedule()
+    expected = suffix_budget
+    if batch_invariant and suffix_budget < 572:
+        expected = suffix_budget // 64 * 64
+    assert output.num_scheduled_tokens.get(target.request_id, 0) == expected
+    if expected:
+        complete_step(output, target)
+    else:
+        assert target.status == RequestStatus.WAITING
+
+    # Exercise both the waiting and running paths, including the final short
+    # chunk and normal decode. A tiny leftover budget must defer, not deadlock.
+    scheduler.max_num_scheduled_tokens = 172
+    for _ in range(6):
+        if target.num_computed_tokens >= target.num_prompt_tokens:
+            break
+        output = scheduler.schedule()
+        count = output.num_scheduled_tokens[target.request_id]
+        assert 0 < count <= 172
+        if batch_invariant and target.num_computed_tokens < target.num_prompt_tokens:
+            assert target.num_computed_tokens % 64 == 0
+        complete_step(output, target)
+    assert target.num_computed_tokens == 5756
+    assert scheduler.schedule().num_scheduled_tokens[target.request_id] == 1
 
 
 def test_add_requests():

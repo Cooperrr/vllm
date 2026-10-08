@@ -84,6 +84,7 @@ def test_uninitialized_backend_raises():
     [
         MambaAttentionBackendEnum.LINEAR,
         MambaAttentionBackendEnum.GDN_ATTN,
+        MambaAttentionBackendEnum.QWEN_GDN_ATTN,
         MambaAttentionBackendEnum.SHORT_CONV,
     ],
 )

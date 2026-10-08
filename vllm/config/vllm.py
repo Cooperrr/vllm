@@ -2115,6 +2115,16 @@ class VllmConfig:
                 "max_num_batched_tokens "
                 f"({self.scheduler_config.max_num_batched_tokens})."
             )
+            # An explicit scheduling budget overrides max_num_batched_tokens.
+            # If it cannot fit one block, aligned prefills cannot make progress.
+            max_num_scheduled_tokens = self.scheduler_config.max_num_scheduled_tokens
+            if max_num_scheduled_tokens is not None:
+                assert block_size <= max_num_scheduled_tokens, (
+                    "In Mamba cache align mode, block_size "
+                    f"({block_size}) must be <= "
+                    "max_num_scheduled_tokens "
+                    f"({max_num_scheduled_tokens}) when set."
+                )
             if self.scheduler_config.long_prefill_token_threshold > 0:
                 assert self.scheduler_config.long_prefill_token_threshold >= block_size
             assert not self.scheduler_config.disable_chunked_mm_input, (

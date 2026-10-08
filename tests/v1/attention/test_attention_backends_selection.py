@@ -6,15 +6,114 @@ from types import SimpleNamespace
 
 import pytest
 
+import vllm.envs as envs
+from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+    QwenGatedDeltaNetAttention,
+)
 from vllm.model_executor.layers.mamba.mamba_mixer import MambaMixer
 from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
 from vllm.model_executor.layers.mamba.short_conv import ShortConv
 from vllm.model_executor.models.minimax_text_01 import MiniMaxText01LinearAttention
+from vllm.v1.attention.backends.gdn_attn import (
+    GDNAttentionBackend,
+    QwenGDNAttentionBackend,
+)
 from vllm.v1.attention.backends.linear_attn import LinearAttentionBackend
 from vllm.v1.attention.backends.mamba1_attn import Mamba1AttentionBackend
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionBackend
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.attention.backends.short_conv_attn import ShortConvAttentionBackend
+from vllm.v1.attention.selector import (
+    _cached_get_mamba_attn_backend,
+    get_mamba_attn_backend,
+)
+
+
+@pytest.mark.parametrize("batch_invariant", [False, True])
+@pytest.mark.parametrize(
+    "model_type", ["qwen3_5_text", "qwen3_5_moe_text", "qwen3_next", "other_gdn"]
+)
+def test_gdn_batch_invariant_model_gate(monkeypatch, batch_invariant, model_type):
+    """Use the real model-to-backend selection and startup support check."""
+    from vllm import platforms
+
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", batch_invariant)
+    monkeypatch.setattr(
+        platforms,
+        "current_platform",
+        SimpleNamespace(
+            is_cuda=lambda: True,
+            is_device_capability=lambda capability: capability == 120,
+        ),
+    )
+    layer = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(model_type=model_type)
+        )
+    )
+    mamba_type = QwenGatedDeltaNetAttention.mamba_type.__get__(layer)
+    _cached_get_mamba_attn_backend.cache_clear()
+    try:
+        if batch_invariant and model_type != "qwen3_5_text":
+            with pytest.raises(
+                RuntimeError,
+                match=r"supported only for dense Qwen3\.5.*qwen3_5_text",
+            ):
+                get_mamba_attn_backend(mamba_type)
+        else:
+            expected = (
+                QwenGDNAttentionBackend
+                if model_type == "qwen3_5_text"
+                else GDNAttentionBackend
+            )
+            assert get_mamba_attn_backend(mamba_type) is expected
+    finally:
+        _cached_get_mamba_attn_backend.cache_clear()
+
+
+@pytest.mark.parametrize(
+    ("model_type", "expected"),
+    [
+        ("qwen3_5_text", MambaAttentionBackendEnum.QWEN_GDN_ATTN),
+        ("qwen3_5_moe_text", MambaAttentionBackendEnum.GDN_ATTN),
+        ("qwen3_next", MambaAttentionBackendEnum.GDN_ATTN),
+    ],
+)
+def test_only_dense_qwen_gdn_uses_batch_invariant_backend(model_type, expected):
+    layer = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(model_type=model_type)
+        )
+    )
+
+    assert QwenGatedDeltaNetAttention.mamba_type.__get__(layer) == expected
+
+
+@pytest.mark.parametrize(
+    ("capability", "expected"),
+    [
+        (80, False),
+        (86, True),
+        (89, True),
+        (90, True),
+        (100, False),
+        (120, True),
+    ],
+)
+def test_qwen_gdn_batch_invariance_capability_gate(
+    monkeypatch: pytest.MonkeyPatch,
+    capability: int,
+    expected: bool,
+):
+    from vllm import platforms
+
+    platform = SimpleNamespace(
+        is_cuda=lambda: True,
+        is_device_capability=lambda candidate: candidate == capability,
+    )
+    monkeypatch.setattr(platforms, "current_platform", platform)
+
+    assert QwenGDNAttentionBackend.supports_batch_invariance() is expected
 
 
 @pytest.mark.parametrize(

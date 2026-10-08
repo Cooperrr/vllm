@@ -65,6 +65,7 @@ from vllm.utils.torch_utils import (
     direct_register_custom_op,
 )
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
 # Optional ROCm AITER Triton kernels for the GDN decode path.
 # Availability is checked centrally via rocm_aiter_ops; the actual function
@@ -276,6 +277,7 @@ def fi_chunk_gated_delta_rule(
         initial_state=fi_state,
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
+        use_cp=False if envs.VLLM_BATCH_INVARIANT else "auto",
     )
     # FlashInfer returns (output, state) when output_final_state=True,
     # or just output when output_final_state=False.
@@ -418,6 +420,15 @@ class ChunkGatedDeltaRule(CustomOp):
 
 @PluggableLayer.register("qwen_gated_delta_net_attention")
 class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+    @property
+    def mamba_type(self) -> MambaAttentionBackendEnum:
+        if (
+            getattr(self.model_config.hf_text_config, "model_type", None)
+            == "qwen3_5_text"
+        ):
+            return MambaAttentionBackendEnum.QWEN_GDN_ATTN
+        return MambaAttentionBackendEnum.GDN_ATTN
+
     def get_state_shape(
         self,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
@@ -1284,7 +1295,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         assert isinstance(attn_metadata, GDNAttentionMetadata)
 
         if (
-            self.enable_packed_recurrent_decode
+            (self.enable_packed_recurrent_decode or envs.VLLM_BATCH_INVARIANT)
             and attn_metadata.spec_sequence_masks is None
             and attn_metadata.num_prefills == 0
             and attn_metadata.num_decodes > 0
@@ -1337,6 +1348,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             mixed_qkv_spec = None
             mixed_qkv_non_spec = mixed_qkv
 
+        split_non_spec = (
+            spec_sequence_masks is None
+            and attn_metadata.num_prefills > 0
+            and attn_metadata.num_decodes > 0
+        )
+        num_decode_tokens = attn_metadata.num_decode_tokens
+
         # 1.1: Process the multi-query part
         if spec_sequence_masks is not None:
             # spec_state_indices_tensor is always set when spec_sequence_masks is set
@@ -1359,20 +1377,51 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # 1.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
             assert mixed_qkv_non_spec is not None
-            mixed_qkv_non_spec_T = mixed_qkv_non_spec.transpose(0, 1)
-            # - "cache_indices" updates the conv_state cache in positions
-            #   pointed to by "state_indices_tensor"
-            mixed_qkv_non_spec = causal_conv1d_fn(
-                mixed_qkv_non_spec_T,
-                conv_weights,
-                self.conv1d.bias,
-                activation=self.activation,
-                conv_states=conv_state,
-                has_initial_state=has_initial_state,
-                cache_indices=non_spec_state_indices_tensor,
-                query_start_loc=non_spec_query_start_loc,
-                metadata=attn_metadata,
-            ).transpose(0, 1)
+            if split_non_spec and envs.VLLM_BATCH_INVARIANT:
+                assert non_spec_state_indices_tensor is not None
+                assert attn_metadata.prefill_has_initial_state is not None
+                assert attn_metadata.prefill_state_indices is not None
+                assert attn_metadata.prefill_query_start_loc is not None
+                conv_output_decode = causal_conv1d_update(
+                    mixed_qkv_non_spec[:num_decode_tokens],
+                    conv_state,
+                    conv_weights,
+                    self.conv1d.bias,
+                    self.activation,
+                    conv_state_indices=non_spec_state_indices_tensor[
+                        : attn_metadata.num_decodes
+                    ],
+                    validate_data=False,
+                )
+                conv_output_prefill = causal_conv1d_fn(
+                    mixed_qkv_non_spec[num_decode_tokens:].transpose(0, 1),
+                    conv_weights,
+                    self.conv1d.bias,
+                    activation=self.activation,
+                    conv_states=conv_state,
+                    has_initial_state=attn_metadata.prefill_has_initial_state,
+                    cache_indices=attn_metadata.prefill_state_indices,
+                    query_start_loc=attn_metadata.prefill_query_start_loc,
+                    metadata=attn_metadata.prefill_conv_metadata,
+                ).transpose(0, 1)
+                mixed_qkv_non_spec = torch.cat(
+                    [conv_output_decode, conv_output_prefill]
+                )
+            else:
+                mixed_qkv_non_spec_T = mixed_qkv_non_spec.transpose(0, 1)
+                # - "cache_indices" updates the conv_state cache in positions
+                #   pointed to by "state_indices_tensor"
+                mixed_qkv_non_spec = causal_conv1d_fn(
+                    mixed_qkv_non_spec_T,
+                    conv_weights,
+                    self.conv1d.bias,
+                    activation=self.activation,
+                    conv_states=conv_state,
+                    has_initial_state=has_initial_state,
+                    cache_indices=non_spec_state_indices_tensor,
+                    query_start_loc=non_spec_query_start_loc,
+                    metadata=attn_metadata,
+                ).transpose(0, 1)
         elif attn_metadata.num_decodes > 0:
             assert mixed_qkv_non_spec is not None
             mixed_qkv_non_spec = causal_conv1d_update(
@@ -1390,14 +1439,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             mixed_qkv_non_spec = None
 
         query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
-
-        # Split mixed non-spec-decode+prefill to process independently
-        split_non_spec = (
-            spec_sequence_masks is None
-            and attn_metadata.num_prefills > 0
-            and attn_metadata.num_decodes > 0
-        )
-        num_decode_tokens = attn_metadata.num_decode_tokens
 
         if attn_metadata.num_prefills > 0:
             assert mixed_qkv_non_spec is not None, (
@@ -1478,25 +1519,40 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # 2.2: Process non-spec-decode part
         if split_non_spec:
-            query_decode, key_decode, value_decode = self.rearrange_mixed_qkv(
-                mixed_qkv_non_spec[:num_decode_tokens]  # type: ignore[index]
-            )
-            core_attn_out_decode, _ = fused_sigmoid_gating_delta_rule_update(
-                A_log=self.A_log,
-                a=a[:num_decode_tokens],
-                b=b[:num_decode_tokens],
-                dt_bias=self.dt_bias,
-                q=query_decode,
-                k=key_decode,
-                v=value_decode,
-                initial_state=ssm_state,
-                inplace_final_state=True,
-                cu_seqlens=non_spec_query_start_loc[  # type: ignore[index]
-                    : attn_metadata.num_decodes + 1
-                ],
-                ssm_state_indices=non_spec_state_indices_tensor,
-                use_qk_l2norm_in_kernel=True,
-            )
+            mixed_qkv_decode = mixed_qkv_non_spec[  # type: ignore[index]
+                :num_decode_tokens
+            ]
+            if self.enable_packed_recurrent_decode or envs.VLLM_BATCH_INVARIANT:
+                core_attn_out_decode = self._forward_packed_recurrent_decode(
+                    mixed_qkv=mixed_qkv_decode,
+                    a=a[:num_decode_tokens],
+                    b=b[:num_decode_tokens],
+                    core_attn_out=core_attn_out[:num_decode_tokens],
+                    ssm_state=ssm_state,
+                    state_indices=non_spec_state_indices_tensor[  # type: ignore[index]
+                        : attn_metadata.num_decodes
+                    ],
+                )
+            else:
+                query_decode, key_decode, value_decode = self.rearrange_mixed_qkv(
+                    mixed_qkv_decode
+                )
+                core_attn_out_decode, _ = fused_sigmoid_gating_delta_rule_update(
+                    A_log=self.A_log,
+                    a=a[:num_decode_tokens],
+                    b=b[:num_decode_tokens],
+                    dt_bias=self.dt_bias,
+                    q=query_decode,
+                    k=key_decode,
+                    v=value_decode,
+                    initial_state=ssm_state,
+                    inplace_final_state=True,
+                    cu_seqlens=non_spec_query_start_loc[  # type: ignore[index]
+                        : attn_metadata.num_decodes + 1
+                    ],
+                    ssm_state_indices=non_spec_state_indices_tensor,
+                    use_qk_l2norm_in_kernel=True,
+                )
         else:
             core_attn_out_decode = None
 
@@ -1680,9 +1736,28 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             conv_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
             validate_data=False,
         )
-        out_buf = core_attn_out[:num_actual_tokens].unsqueeze(1)
-        fused_recurrent_gated_delta_rule_packed_decode(
+        self._forward_packed_recurrent_decode(
             mixed_qkv=mixed_qkv_non_spec,
+            a=a,
+            b=b,
+            core_attn_out=core_attn_out[:num_actual_tokens],
+            ssm_state=ssm_state,
+            state_indices=non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
+        )
+
+    def _forward_packed_recurrent_decode(
+        self,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        core_attn_out: torch.Tensor,
+        ssm_state: torch.Tensor,
+        state_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the shared packed kernel for pure and mixed decode steps."""
+        out_buf = core_attn_out.unsqueeze(1)
+        fused_recurrent_gated_delta_rule_packed_decode(
+            mixed_qkv=mixed_qkv,
             a=a,
             b=b,
             A_log=self.A_log,
@@ -1690,10 +1765,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             scale=self.head_k_dim**-0.5,
             initial_state=ssm_state,
             out=out_buf,
-            ssm_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
+            ssm_state_indices=state_indices,
             use_qk_l2norm_in_kernel=True,
         )
-        return
+        return out_buf.transpose(0, 1)
 
 
 def qwen_gdn_attention_core(

@@ -5,12 +5,47 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+import vllm.envs as envs
 from vllm.model_executor.layers.fla.ops.layernorm_guard import (
     layer_norm_fwd,
     layernorm_fn,
     rms_norm_ref,
 )
 from vllm.utils.torch_utils import set_random_seed
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("hidden_size", [128, 256, 1024])
+@pytest.mark.parametrize("norm_before_gate", [False, True])
+@pytest.mark.parametrize("is_rms_norm", [False, True])
+@torch.inference_mode()
+def test_gated_norm_batch_invariance(
+    monkeypatch, dtype, hidden_size, norm_before_gate, is_rms_norm
+):
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    set_random_seed(3407)
+    x = torch.randn(2048, hidden_size, device="cuda", dtype=dtype)
+    z = torch.randn_like(x)
+    weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
+
+    def normalize(start, end):
+        return layernorm_fn(
+            x[start:end],
+            weight,
+            None,
+            z=z[start:end],
+            norm_before_gate=norm_before_gate,
+            is_rms_norm=is_rms_norm,
+        )
+
+    # A long prefill and small suffixes must use the same reduction order.
+    # Compare every row, including a one-row suffix and an unaligned tail.
+    full = normalize(0, len(x))
+    boundaries = [0, 1, *range(17, len(x), 16), len(x)]
+    split = torch.cat(
+        [normalize(start, end) for start, end in zip(boundaries, boundaries[1:])]
+    )
+    torch.testing.assert_close(split, full, rtol=0, atol=0)
 
 
 def layer_norm_ref(

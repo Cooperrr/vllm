@@ -19,6 +19,7 @@ from vllm.config import (
     VllmConfig,
     set_current_vllm_config,
 )
+from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
@@ -32,6 +33,7 @@ from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.system_utils import update_environment_variables
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.attention.backend import MultipleOf
+from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.core.kv_cache_utils import estimate_max_model_len, get_kv_cache_configs
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
@@ -40,6 +42,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheTensor,
+    MambaSpec,
 )
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -1421,6 +1424,156 @@ def test_hybrid_cache_integration(default_vllm_config, dist_init):
     runner._update_states(scheduler_output)
     assert _is_req_scheduled(runner, req_id)
     assert _is_req_state_block_table_match(runner, req_id)
+
+
+@pytest.mark.parametrize(
+    "mode,capture,mixed",
+    [
+        (CUDAGraphMode.FULL, False, False),
+        (CUDAGraphMode.FULL, True, False),
+        (CUDAGraphMode.NONE, False, False),
+        (CUDAGraphMode.NONE, False, True),
+    ],
+    ids=["replay", "capture", "warmup", "mixed-warmup"],
+)
+def test_gdn_dummy_run_ignores_stale_prefill_flags(
+    dist_init, model_runner, monkeypatch, mode, capture, mixed
+):
+    runner = model_runner
+    monkeypatch.setattr(gpu_model_runner_module.envs, "VLLM_BATCH_INVARIANT", True)
+    runner.compilation_config.cudagraph_mode = CUDAGraphMode.FULL
+    runner.vllm_config.additional_config["gdn_prefill_backend"] = "triton"
+    spec = MambaSpec(block_size=BLOCK_SIZE, shapes=((1, 1),), dtypes=(torch.float32,))
+    builder = GDNAttentionMetadataBuilder(
+        spec, ["layer.0"], runner.vllm_config, runner.device
+    )
+    runner.kv_cache_config.kv_cache_groups[0].kv_cache_spec = spec
+    runner.attn_groups = [
+        [
+            SimpleNamespace(
+                layer_names=["layer.0"], get_metadata_builder=lambda _: builder
+            )
+        ]
+    ]
+    # Leave live and padded rows looking like one-token prompt suffixes.
+    computed = runner.input_batch.num_computed_tokens_cpu_tensor
+    prompt = runner.input_batch.num_prompt_tokens_cpu_tensor
+    computed.fill_(64)
+    prompt.fill_(65)
+    builder.non_spec_state_indices_tensor.fill_(99)
+    builder.non_spec_query_start_loc.fill_(99)
+
+    num_tokens = 8 if mixed else 3
+    padded_tokens = 4 if mode == CUDAGraphMode.FULL else num_tokens
+    num_reqs = 5 if mixed else padded_tokens
+    monkeypatch.setattr(
+        runner,
+        "_determine_batch_execution_and_padding",
+        lambda **_: (
+            mode,
+            SimpleNamespace(num_tokens=padded_tokens, num_reqs=num_reqs),
+            False,
+            None,
+            None,
+        ),
+    )
+
+    class MetadataBuilt(Exception):
+        pass
+
+    def check_metadata(**kwargs):
+        metadata, _ = GPUModelRunner._build_attention_metadata(runner, **kwargs)
+        gdn = metadata["layer.0"]
+        assert gdn.num_prefills == int(mixed)
+        assert gdn.num_decodes == (4 if mixed else num_reqs)
+        if not mixed:
+            # A decode build must refresh the persistent graph inputs, even
+            # when its request rows previously belonged to real prefills.
+            assert builder.non_spec_state_indices_tensor[:num_reqs].tolist() == (
+                [0] * num_reqs
+            )
+            assert builder.non_spec_query_start_loc[: num_reqs + 1].tolist() == (
+                [0, 1, 2, 3, 3] if num_reqs == 4 else [0, 1, 2, 3]
+            )
+        # Exercise dummy input preparation and the real GDN builder without
+        # loading weights or running a model forward pass.
+        raise MetadataBuilt
+
+    monkeypatch.setattr(runner, "_build_attention_metadata", check_metadata)
+    with pytest.raises(MetadataBuilt):
+        runner._dummy_run(
+            num_tokens,
+            cudagraph_runtime_mode=mode,
+            force_attention=True,
+            uniform_decode=not mixed,
+            create_mixed_batch=mixed,
+            is_graph_capturing=capture,
+        )
+
+    assert torch.all(computed == 64)
+    assert torch.all(prompt == 65)
+    # Ordinary execution must still recognize an actual one-token suffix.
+    runner.optimistic_seq_lens_cpu[0] = 65
+    runner.seq_lens[0] = 65
+    metadata, _ = GPUModelRunner._build_attention_metadata(
+        runner,
+        num_tokens=1,
+        num_reqs=1,
+        max_query_len=1,
+        slot_mappings={0: torch.full((1,), -1, device=runner.device)},
+    )
+    assert metadata["layer.0"].num_prefills == 1
+    assert metadata["layer.0"].num_decodes == 0
+
+
+@pytest.mark.parametrize("batch_invariant", [False, True])
+@pytest.mark.parametrize("prefilling", [False, True])
+@pytest.mark.parametrize("capture", [False, True])
+def test_qwen_gdn_prompt_suffix_avoids_decode_graph(
+    monkeypatch, batch_invariant, prefilling, capture
+):
+    monkeypatch.setattr(
+        gpu_model_runner_module.envs, "VLLM_BATCH_INVARIANT", batch_invariant
+    )
+    dispatcher = Mock()
+    dispatcher.dispatch.return_value = (
+        gpu_model_runner_module.CUDAGraphMode.NONE,
+        SimpleNamespace(num_tokens=1),
+    )
+    runner = SimpleNamespace(
+        _is_uniform_decode=GPUModelRunner._is_uniform_decode,
+        uniform_decode_query_len=1,
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(model_type="qwen3_5_text"),
+            is_encoder_decoder=False,
+        ),
+        input_batch=SimpleNamespace(
+            num_computed_tokens_cpu=np.array([64]),
+            num_prompt_tokens=np.array([65 if prefilling else 64]),
+            lora_id_to_lora_request={},
+        ),
+        _pad_for_sequence_parallelism=lambda n: n,
+        cudagraph_dispatcher=dispatcher,
+        compilation_config=SimpleNamespace(
+            pass_config=SimpleNamespace(enable_sp=False)
+        ),
+        vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(data_parallel_size=1),
+            observability_config=SimpleNamespace(cudagraph_metrics=False),
+        ),
+    )
+    GPUModelRunner._determine_batch_execution_and_padding(
+        runner,
+        num_tokens=1,
+        num_reqs=1,
+        num_scheduled_tokens_np=np.array([1]),
+        max_num_scheduled_tokens=1,
+        use_cascade_attn=False,
+        force_uniform_decode=True if capture else None,
+    )
+    assert dispatcher.dispatch.call_args.kwargs["uniform_decode"] == (
+        capture or not (batch_invariant and prefilling)
+    )
 
 
 def test_is_uniform_decode() -> None:

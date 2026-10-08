@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+from vllm import envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -60,6 +61,8 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+_QWEN_GDN_PREFILL_CHUNK_SIZE = 64
 
 
 class Scheduler(SchedulerInterface):
@@ -261,6 +264,20 @@ class Scheduler(SchedulerInterface):
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
         )
+        self.need_qwen_gdn_prefill_alignment = (
+            envs.VLLM_BATCH_INVARIANT and kv_cache_config.has_qwen_gdn_layers
+        )
+        if (
+            self.need_mamba_block_aligned_split
+            and self.need_qwen_gdn_prefill_alignment
+            and self.cache_config.block_size % _QWEN_GDN_PREFILL_CHUNK_SIZE != 0
+        ):
+            # GDN alignment must not shorten a cache-block-aligned chunk.
+            raise ValueError(
+                "Qwen GDN batch invariance with Mamba align caching requires "
+                f"block_size ({self.cache_config.block_size}) to be a multiple "
+                f"of {_QWEN_GDN_PREFILL_CHUNK_SIZE}."
+            )
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
             self.perf_metrics = ModelMetrics(vllm_config)
@@ -308,7 +325,13 @@ class Scheduler(SchedulerInterface):
         #                       num_prompt_tokens + num_output_tokens
         #                     )
         # NOTE: Use `request.num_tokens - 1` to bypass normal decoding.
-        if num_computed_tokens < max(request.num_prompt_tokens, request.num_tokens - 1):
+        prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
+        cache_end = request.num_tokens
+        if self.need_qwen_gdn_prefill_alignment:
+            # Batch-invariant GDN replays generated tokens through decode.
+            # Only the original prompt needs prefill/cache-block alignment.
+            prefill_end = cache_end = request.num_prompt_tokens
+        if num_computed_tokens < prefill_end:
             # To enable block-aligned caching of the Mamba state, `num_new_tokens`
             # must be a multiple of `block_size`.
             # As an exception, if `num_new_tokens` is less than `block_size`, the
@@ -317,7 +340,7 @@ class Scheduler(SchedulerInterface):
             # matching block. To prevent this from causing a Mamba cache miss, the
             # last chunk must be not smaller than `block_size`.
             block_size = self.cache_config.block_size
-            last_cache_position = request.num_tokens - request.num_tokens % block_size
+            last_cache_position = cache_end - cache_end % block_size
             # eagle prune
             if self.use_eagle:
                 last_cache_position = max(last_cache_position - block_size, 0)
@@ -336,6 +359,34 @@ class Scheduler(SchedulerInterface):
                 # prefill the last few tokens
                 pass
         return num_new_tokens
+
+    def _qwen_gdn_batch_invariant_split(
+        self,
+        request: Request,
+        num_new_tokens: int,
+        num_new_local_computed_tokens: int = 0,
+        num_external_computed_tokens: int = 0,
+    ) -> int:
+        """Align prompt chunks and replay generated tokens through decode."""
+        start = (
+            request.num_computed_tokens
+            + num_new_local_computed_tokens
+            + num_external_computed_tokens
+        )
+        prefill_end = request.num_prompt_tokens
+        if start >= prefill_end:
+            # After preemption, replay the recorded output one token at a time
+            # using the same recurrent kernel as uninterrupted decoding. The
+            # runner discards samples until we catch up with the saved tokens.
+            return min(num_new_tokens, 1)
+
+        # Never combine the prompt's last chunk with previously generated text:
+        # the chunk and recurrent kernels have different rounding.
+        end = min(start + num_new_tokens, prefill_end)
+        if end < prefill_end:
+            end = end // _QWEN_GDN_PREFILL_CHUNK_SIZE
+            end *= _QWEN_GDN_PREFILL_CHUNK_SIZE
+        return max(end - start, 0)
 
     def schedule(self) -> SchedulerOutput:
         self.current_step += 1
@@ -435,6 +486,13 @@ class Scheduler(SchedulerInterface):
 
             if self.need_mamba_block_aligned_split:
                 num_new_tokens = self._mamba_block_aligned_split(
+                    request, num_new_tokens
+                )
+            # Mamba cache alignment allows arbitrary splits after the last
+            # cacheable block. GDN still needs intermediate suffix chunks to
+            # end on its chunk grid, so apply both constraints.
+            if self.need_qwen_gdn_prefill_alignment:
+                num_new_tokens = self._qwen_gdn_batch_invariant_split(
                     request, num_new_tokens
                 )
 
@@ -720,6 +778,15 @@ class Scheduler(SchedulerInterface):
                 # Skip block alignment when setting up async receive (no local work).
                 if self.need_mamba_block_aligned_split and not load_kv_async:
                     num_new_tokens = self._mamba_block_aligned_split(
+                        request,
+                        num_new_tokens,
+                        num_new_local_computed_tokens,
+                        num_external_computed_tokens,
+                    )
+                    if num_new_tokens == 0:
+                        break
+                if self.need_qwen_gdn_prefill_alignment and not load_kv_async:
+                    num_new_tokens = self._qwen_gdn_batch_invariant_split(
                         request,
                         num_new_tokens,
                         num_new_local_computed_tokens,

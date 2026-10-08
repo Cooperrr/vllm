@@ -8,6 +8,7 @@ import pytest
 import torch
 from utils import (
     BACKENDS,
+    LANGUAGE_MODEL_ONLY,
     TEST_MODEL,
     _extract_step_logprobs,
     _random_prompt,
@@ -16,6 +17,32 @@ from utils import (
 
 import vllm.envs as envs
 from vllm import LLM, SamplingParams
+from vllm.model_executor.layers.batch_invariant import (
+    override_envs_for_invariance,
+)
+
+
+def _get_aot_compile_stats(_model):
+    """Return worker-local AOT state; this function must be picklable."""
+    import vllm.envs as worker_envs
+    from vllm.compilation.counter import compilation_counter
+
+    return {
+        "enabled": worker_envs.VLLM_USE_AOT_COMPILE,
+        "compiled": compilation_counter.num_aot_compiles,
+        "loaded": compilation_counter.num_aot_artifacts_loaded,
+    }
+
+
+def test_override_envs_for_invariance_preserves_aot_compile(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    test_env = {"VLLM_USE_AOT_COMPILE": "1"}
+    monkeypatch.setattr(os, "environ", test_env)
+
+    override_envs_for_invariance()
+
+    assert os.environ["VLLM_USE_AOT_COMPILE"] == "1"
 
 
 @skip_unsupported
@@ -89,12 +116,14 @@ def test_v1_generation_is_deterministic_across_batch_sizes_with_needle(
             max_model_len=max_model_len,
             attention_config=attention_config,
         )
+        assert llm.llm_engine.vllm_config.scheduler_config.async_scheduling is True
 
         # Baseline generation for the needle prompt alone.
         baseline_out = llm.generate([needle_prompt], sampling)
         assert len(baseline_out) == 1
         assert len(baseline_out[0].outputs) >= 1
         baseline_text = baseline_out[0].outputs[0].text
+        baseline_token_ids = baseline_out[0].outputs[0].token_ids
 
         mismatches = 0
 
@@ -117,8 +146,9 @@ def test_v1_generation_is_deterministic_across_batch_sizes_with_needle(
             assert needle_output.prompt == needle_prompt
             assert len(needle_output.outputs) >= 1
             text = needle_output.outputs[0].text
+            token_ids = needle_output.outputs[0].token_ids
 
-            if text != baseline_text:
+            if text != baseline_text or token_ids != baseline_token_ids:
                 print(f"{text}\n\n== Not the same as ==\n\n{baseline_text}\n\n")
                 mismatches += 1
 
@@ -155,7 +185,13 @@ def test_logprobs_bitwise_batch_invariance_bs1_vs_bsN(
     backend,
     block_m,
     block_n,
+    monkeypatch: pytest.MonkeyPatch,
 ):
+    # Exercise the AOT path explicitly and verify it remains enabled in every
+    # worker. This guards against invariance setup silently disabling AOT.
+    monkeypatch.setenv("VLLM_USE_AOT_COMPILE", "1")
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+
     seed = int(os.getenv("VLLM_TEST_SEED", "12345"))
     random.seed(seed)
     tp_size = int(os.getenv("VLLM_TEST_TP_SIZE", "1"))
@@ -178,6 +214,7 @@ def test_logprobs_bitwise_batch_invariance_bs1_vs_bsN(
         max_model_len=8192,
         dtype="auto",  # not everything is supported
         gpu_memory_utilization=0.9,
+        language_model_only=LANGUAGE_MODEL_ONLY,
         attention_config={
             "backend": backend,
             "flex_attn_block_m": block_m,
@@ -248,6 +285,14 @@ def test_logprobs_bitwise_batch_invariance_bs1_vs_bsN(
             )
         bsN_logprobs_per_prompt.append(step_logprobs)
         bsN_tokens_per_prompt.append(token_ids)
+
+    aot_stats = llm.apply_model(_get_aot_compile_stats)
+    assert aot_stats
+    for rank, stats in enumerate(aot_stats):
+        assert stats["enabled"], f"AOT compile was disabled on rank {rank}"
+        assert stats["compiled"] + stats["loaded"] > 0, (
+            f"AOT compile was not exercised on rank {rank}: {stats}"
+        )
 
     # Compare step-by-step logprobs for each prompt between BS=1 and BS=N runs.
     failed_prompts = []
@@ -923,6 +968,8 @@ def LLM_with_max_seqs(
         dtype="auto",
         tensor_parallel_size=int(os.getenv("VLLM_TP_SIZE", "1")),
         enable_prefix_caching=False,
+        language_model_only=True,
+        async_scheduling=True,
         attention_config=attention_config,
         # Enable for MOE models
         # enable_expert_parallel=True,

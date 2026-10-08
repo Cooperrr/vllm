@@ -2,7 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import TYPE_CHECKING
 
+import torch
+
+from vllm import envs
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.utils.math_utils import round_up
 
 if TYPE_CHECKING:
@@ -535,6 +539,26 @@ class Qwen3VLForSequenceClassificationConfig(Qwen3ForSequenceClassificationConfi
 
 class Qwen3_5ForConditionalGenerationConfig(VerifyAndUpdateConfig):
     @staticmethod
+    def _supports_batch_invariant_quantization(model_config: "ModelConfig") -> bool:
+        if (
+            not current_platform.is_cuda()
+            or model_config.quantization != "compressed-tensors"
+            or model_config.quantization_config is not None
+        ):
+            return False
+
+        quantization_config = getattr(
+            model_config.model_arch_config, "quantization_config", None
+        )
+        return (
+            isinstance(quantization_config, dict)
+            and quantization_config.get("format") == "float-quantized"
+            and quantization_config.get("kv_cache_scheme") is None
+            and not quantization_config.get("transform_config")
+            and not quantization_config.get("sparsity_config")
+        )
+
+    @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
         """Update mamba_ssm_cache_dtype for Qwen3.5 models when set to 'auto'
         (or not explicitly set), to the value specified in the HF config's
@@ -557,6 +581,101 @@ class Qwen3_5ForConditionalGenerationConfig(VerifyAndUpdateConfig):
                 "Using the user-specified value.",
                 mamba_ssm_dtype,
                 cache_config.mamba_ssm_cache_dtype,
+            )
+
+        # Validate after resolving the checkpoint's preferred state dtype.
+        if envs.VLLM_BATCH_INVARIANT and hf_text_config.model_type == "qwen3_5_text":
+            Qwen3_5ForConditionalGenerationConfig._verify_batch_invariant_profile(
+                vllm_config
+            )
+
+    @staticmethod
+    def _verify_batch_invariant_profile(vllm_config: "VllmConfig") -> None:
+        """Validate the dense Qwen GDN batch-invariance configuration."""
+        from vllm.model_executor.layers.mamba.mamba_utils import (
+            MambaStateDtypeCalculator,
+        )
+
+        model_config = vllm_config.model_config
+        cache_config = vllm_config.cache_config
+        parallel_config = vllm_config.parallel_config
+        scheduler_config = vllm_config.scheduler_config
+        invalid_reasons: list[str] = []
+
+        if model_config.dtype not in (torch.bfloat16, torch.float16):
+            invalid_reasons.append("dtype must be bfloat16 or float16")
+        _, ssm_dtype = MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+            model_config.dtype,
+            cache_config.mamba_cache_dtype,
+            cache_config.mamba_ssm_cache_dtype,
+        )
+        if ssm_dtype != torch.float32:
+            invalid_reasons.append(
+                "SSM cache dtype must resolve to float32 "
+                f"(got {ssm_dtype}); set --mamba-ssm-cache-dtype=float32"
+            )
+        has_quantized_weights = (
+            model_config.quantization is not None
+            or model_config.quantization_config is not None
+            or model_config.is_quantized
+            or getattr(model_config.hf_text_config, "quantization_config", None)
+            is not None
+        )
+        profile = Qwen3_5ForConditionalGenerationConfig
+        quantization_supported = profile._supports_batch_invariant_quantization(
+            model_config
+        )
+        if has_quantized_weights and not quantization_supported:
+            invalid_reasons.append("quantized weights must use compressed-tensors FP8")
+
+        multimodal_config = model_config.multimodal_config
+        if multimodal_config is None or not multimodal_config.language_model_only:
+            invalid_reasons.append("--language-model-only must be enabled")
+        if parallel_config.tensor_parallel_size != 1:
+            invalid_reasons.append("tensor parallel size must be 1")
+        if parallel_config.pipeline_parallel_size != 1:
+            invalid_reasons.append("pipeline parallel size must be 1")
+        if vllm_config.lora_config is not None:
+            invalid_reasons.append("LoRA adapters are not supported")
+        if vllm_config.speculative_config is not None:
+            invalid_reasons.append("speculative decoding is not supported")
+
+        kv_transfer_config = vllm_config.kv_transfer_config
+        ec_transfer_config = vllm_config.ec_transfer_config
+        if (
+            kv_transfer_config is not None
+            and kv_transfer_config.is_kv_transfer_instance
+        ) or (
+            ec_transfer_config is not None
+            and ec_transfer_config.is_ec_transfer_instance
+        ):
+            invalid_reasons.append("KV and EC connectors are not supported")
+
+        prefill_chunk_size = 64
+        if scheduler_config.max_num_batched_tokens < prefill_chunk_size:
+            invalid_reasons.append(
+                f"max_num_batched_tokens must be at least {prefill_chunk_size}"
+            )
+        if (
+            scheduler_config.max_num_scheduled_tokens is not None
+            and scheduler_config.max_num_scheduled_tokens < prefill_chunk_size
+        ):
+            invalid_reasons.append(
+                f"max_num_scheduled_tokens must be at least {prefill_chunk_size} "
+                "when set"
+            )
+        long_prefill_token_threshold = scheduler_config.long_prefill_token_threshold
+        if 0 < long_prefill_token_threshold < prefill_chunk_size:
+            invalid_reasons.append(
+                "long_prefill_token_threshold must be at least "
+                f"{prefill_chunk_size} when enabled"
+            )
+
+        if invalid_reasons:
+            reasons = "; ".join(invalid_reasons)
+            raise ValueError(
+                "Qwen GDN batch invariance is outside the currently validated "
+                f"profile: {reasons}."
             )
 
 

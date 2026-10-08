@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 import pydantic
 import pytest
+import torch
 from pydantic import ValidationError
 
 import vllm.config.vllm as vllm_config_module
@@ -33,9 +34,255 @@ from vllm.config.vllm import (
     OPTIMIZATION_LEVEL_TO_CONFIG,
     OptimizationLevel,
 )
+from vllm.model_executor.models.config import (
+    Qwen3_5ForConditionalGenerationConfig,
+)
 from vllm.platforms import current_platform
 
 DEVICE_TYPE = current_platform.device_type
+
+
+@pytest.mark.parametrize(
+    "cache_mode,batched_tokens,scheduled_tokens,error_limit",
+    [
+        ("align", 2048, 0, "max_num_scheduled_tokens"),
+        ("align", 2048, 128, "max_num_scheduled_tokens"),
+        ("align", 2048, 575, "max_num_scheduled_tokens"),
+        ("align", 2048, 576, None),
+        ("align", 2048, 577, None),
+        ("align", 2048, 2048, None),
+        ("align", 2048, None, None),
+        ("align", 575, None, "max_num_batched_tokens"),
+        ("align", 576, None, None),
+        ("align", 575, 576, "max_num_batched_tokens"),
+        ("none", 2048, 128, None),
+        ("all", 2048, 128, None),
+    ],
+)
+def test_mamba_align_block_size_validates_token_budgets(
+    monkeypatch, cache_mode, batched_tokens, scheduled_tokens, error_limit
+):
+    monkeypatch.setattr(envs, "VLLM_USE_V2_MODEL_RUNNER", False)
+    # Validate the finalized hybrid block size, which can exceed the requested
+    # attention block size after Mamba page alignment.
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=576, mamba_cache_mode=cache_mode),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        scheduler_config=SimpleNamespace(
+            max_num_batched_tokens=batched_tokens,
+            max_num_scheduled_tokens=scheduled_tokens,
+            long_prefill_token_threshold=0,
+            disable_chunked_mm_input=False,
+        ),
+    )
+
+    if error_limit is not None:
+        limit = getattr(config.scheduler_config, error_limit)
+        with pytest.raises(
+            AssertionError,
+            match=rf"block_size \(576\) must be <= {error_limit} \({limit}\)",
+        ):
+            VllmConfig.validate_block_size(config)
+    else:
+        VllmConfig.validate_block_size(config)
+
+
+def _qwen_gdn_batch_invariant_config() -> SimpleNamespace:
+    return SimpleNamespace(
+        model_config=SimpleNamespace(
+            dtype=torch.bfloat16,
+            quantization=None,
+            quantization_config=None,
+            is_quantized=False,
+            hf_text_config=SimpleNamespace(
+                model_type="qwen3_5_text",
+                quantization_config=None,
+                mamba_ssm_dtype="float32",
+            ),
+            model_arch_config=SimpleNamespace(quantization_config=None),
+            multimodal_config=SimpleNamespace(language_model_only=True),
+        ),
+        cache_config=SimpleNamespace(
+            enable_prefix_caching=False,
+            mamba_cache_mode="none",
+            mamba_cache_dtype="auto",
+            mamba_ssm_cache_dtype="float32",
+        ),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1,
+            pipeline_parallel_size=1,
+        ),
+        scheduler_config=SimpleNamespace(
+            async_scheduling=False,
+            max_num_batched_tokens=64,
+            max_num_scheduled_tokens=None,
+            long_prefill_token_threshold=0,
+        ),
+        lora_config=None,
+        speculative_config=None,
+        kv_transfer_config=None,
+        ec_transfer_config=None,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("async_scheduling", [False, True, None])
+@pytest.mark.parametrize("prefix_caching", [False, True])
+def test_qwen_gdn_batch_invariant_profile_accepts_supported_config(
+    dtype, async_scheduling, prefix_caching
+):
+    config = _qwen_gdn_batch_invariant_config()
+    config.model_config.dtype = dtype
+    config.scheduler_config.async_scheduling = async_scheduling
+    config.cache_config.enable_prefix_caching = prefix_caching
+    config.cache_config.mamba_cache_mode = "align" if prefix_caching else "none"
+
+    Qwen3_5ForConditionalGenerationConfig._verify_batch_invariant_profile(config)
+
+
+@pytest.mark.parametrize("model_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "ssm_dtype,hf_dtype,cache_dtype,supported",
+    [
+        ("auto", "float32", "auto", True),
+        ("auto", "float32", "bfloat16", True),
+        ("auto", None, "float32", True),
+        ("float32", None, "auto", True),
+        ("float32", "bfloat16", "auto", True),
+        ("auto", None, "auto", False),
+        ("auto", None, "bfloat16", False),
+        ("auto", "bfloat16", "float32", False),
+        ("auto", "float16", "auto", False),
+        ("bfloat16", "float32", "auto", False),
+        ("float16", "float32", "float32", False),
+    ],
+)
+def test_qwen_gdn_batch_invariant_profile_resolves_ssm_dtype(
+    monkeypatch, model_dtype, ssm_dtype, hf_dtype, cache_dtype, supported
+):
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    config = _qwen_gdn_batch_invariant_config()
+    config.model_config.dtype = model_dtype
+    config.cache_config.mamba_ssm_cache_dtype = ssm_dtype
+    config.cache_config.mamba_cache_dtype = cache_dtype
+    if hf_dtype is None:
+        del config.model_config.hf_text_config.mamba_ssm_dtype
+    else:
+        config.model_config.hf_text_config.mamba_ssm_dtype = hf_dtype
+
+    verify = Qwen3_5ForConditionalGenerationConfig.verify_and_update_config
+    if supported:
+        verify(config)
+        expected = hf_dtype if ssm_dtype == "auto" and hf_dtype else ssm_dtype
+        assert config.cache_config.mamba_ssm_cache_dtype == expected
+    else:
+        with pytest.raises(
+            ValueError,
+            match="SSM cache dtype must resolve to float32.*"
+            "set --mamba-ssm-cache-dtype=float32",
+        ):
+            verify(config)
+
+
+@pytest.mark.parametrize(
+    "batch_invariant,model_type",
+    [(False, "qwen3_5_text"), (True, "qwen3_5_moe_text")],
+)
+def test_qwen_gdn_ssm_dtype_restriction_is_profile_specific(
+    monkeypatch, batch_invariant, model_type
+):
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", batch_invariant)
+    config = _qwen_gdn_batch_invariant_config()
+    config.model_config.hf_text_config.model_type = model_type
+    config.cache_config.mamba_ssm_cache_dtype = "bfloat16"
+
+    Qwen3_5ForConditionalGenerationConfig.verify_and_update_config(config)
+
+    assert config.cache_config.mamba_ssm_cache_dtype == "bfloat16"
+
+
+@pytest.mark.parametrize(
+    "setting",
+    [
+        "max_num_batched_tokens",
+        "max_num_scheduled_tokens",
+        "long_prefill_token_threshold",
+    ],
+)
+def test_qwen_gdn_batch_invariant_profile_rejects_sub_chunk_limit(setting):
+    config = _qwen_gdn_batch_invariant_config()
+    setattr(config.scheduler_config, setting, 63)
+
+    with pytest.raises(ValueError, match=f"{setting} must be at least 64"):
+        Qwen3_5ForConditionalGenerationConfig._verify_batch_invariant_profile(config)
+
+
+@pytest.mark.parametrize(
+    "setting",
+    [
+        "max_num_batched_tokens",
+        "max_num_scheduled_tokens",
+        "long_prefill_token_threshold",
+    ],
+)
+def test_qwen_gdn_batch_invariant_profile_accepts_chunk_sized_limit(setting):
+    config = _qwen_gdn_batch_invariant_config()
+    setattr(config.scheduler_config, setting, 64)
+
+    Qwen3_5ForConditionalGenerationConfig._verify_batch_invariant_profile(config)
+
+
+def test_qwen_gdn_batch_invariant_profile_accepts_compressed_tensors_fp8(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    config = _qwen_gdn_batch_invariant_config()
+    config.model_config.quantization = "compressed-tensors"
+    config.model_config.is_quantized = True
+    config.model_config.model_arch_config.quantization_config = {
+        "format": "float-quantized",
+        "kv_cache_scheme": None,
+        "sparsity_config": {},
+        "transform_config": {},
+    }
+
+    Qwen3_5ForConditionalGenerationConfig._verify_batch_invariant_profile(config)
+
+
+def test_qwen_gdn_batch_invariant_profile_reports_all_violations():
+    config = _qwen_gdn_batch_invariant_config()
+    config.model_config.dtype = torch.float32
+    config.cache_config.mamba_ssm_cache_dtype = "bfloat16"
+    config.model_config.quantization = "fp8"
+    config.model_config.multimodal_config.language_model_only = False
+    config.parallel_config.tensor_parallel_size = 2
+    config.parallel_config.pipeline_parallel_size = 2
+    config.lora_config = object()
+    config.speculative_config = object()
+    config.kv_transfer_config = SimpleNamespace(is_kv_transfer_instance=True)
+    config.scheduler_config.max_num_batched_tokens = 63
+    config.scheduler_config.max_num_scheduled_tokens = 63
+    config.scheduler_config.long_prefill_token_threshold = 63
+
+    with pytest.raises(ValueError) as exc_info:
+        Qwen3_5ForConditionalGenerationConfig._verify_batch_invariant_profile(config)
+
+    message = str(exc_info.value)
+    expected_reasons = (
+        "dtype must be bfloat16 or float16",
+        "SSM cache dtype must resolve to float32",
+        "quantized weights must use compressed-tensors FP8",
+        "--language-model-only must be enabled",
+        "tensor parallel size must be 1",
+        "pipeline parallel size must be 1",
+        "LoRA adapters are not supported",
+        "speculative decoding is not supported",
+        "KV and EC connectors are not supported",
+        "max_num_batched_tokens must be at least 64",
+        "max_num_scheduled_tokens must be at least 64 when set",
+        "long_prefill_token_threshold must be at least 64 when enabled",
+    )
+    assert all(reason in message for reason in expected_reasons)
 
 
 def test_compile_config_repr_succeeds():

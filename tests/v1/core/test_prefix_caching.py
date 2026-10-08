@@ -4,11 +4,13 @@
 
 import copy
 from collections.abc import Callable
+from dataclasses import replace
 from math import lcm
 
 import pytest
 import torch
 
+import vllm.envs as envs
 import vllm.v1.core.kv_cache_manager as kv_cache_manager
 import vllm.v1.core.kv_cache_utils as kv_cache_utils
 from vllm.distributed.kv_events import AllBlocksCleared, BlockRemoved, BlockStored
@@ -20,6 +22,7 @@ from vllm.multimodal.inputs import (
 )
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256, sha256_cbor
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.core.block_pool import BlockHashToBlockMap, BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheManager, Request
 from vllm.v1.core.kv_cache_utils import (
@@ -981,6 +984,125 @@ def test_prefill_hybrid_model_combinations_eagle(
 
     manager.free(req0)
     manager.free(req1)
+
+
+@pytest.mark.parametrize("batch_invariant", [False, True])
+@pytest.mark.parametrize("delay_cache_blocks", [False, True])
+@pytest.mark.parametrize(
+    "mamba_type",
+    [None, MambaAttentionBackendEnum.GDN_ATTN, MambaAttentionBackendEnum.QWEN_GDN_ATTN],
+)
+def test_generated_gdn_blocks_are_not_published(
+    monkeypatch, batch_invariant, delay_cache_blocks, mamba_type
+):
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", batch_invariant)
+    block_size = 64
+    spec_types = ["full"] if mamba_type is None else ["full", "mamba_align"]
+    config = _make_hybrid_kv_cache_config(block_size, 30, spec_types)
+    if mamba_type is not None:
+        group = config.kv_cache_groups[1]
+        group.kv_cache_spec = replace(group.kv_cache_spec, mamba_type=mamba_type)
+    manager = make_kv_cache_manager(
+        config, max_model_len=8192, enable_caching=True, hash_block_size=block_size
+    )
+    prompt = list(range(2 * block_size - 1))
+    donor = make_request("donor", prompt, block_size, sha256)
+
+    def compute(request, count, **kwargs):
+        manager.new_step_starts()
+        blocks = manager.allocate_slots(
+            request, count, delay_cache_blocks=delay_cache_blocks, **kwargs
+        )
+        assert blocks is not None
+        request.num_computed_tokens += count + kwargs.get("num_new_computed_tokens", 0)
+        if delay_cache_blocks:
+            manager.cache_blocks(request, request.num_computed_tokens)
+
+    # Save a reusable prompt block, then complete the partial prompt block.
+    compute(donor, block_size)
+    compute(donor, block_size - 1)
+    donor.append_output_token_ids(9001)
+    compute(donor, 1)
+    donor.append_output_token_ids(9002)
+
+    prompt_only = (
+        batch_invariant and mamba_type == MambaAttentionBackendEnum.QWEN_GDN_ATTN
+    )
+    # The restriction must cover attention too: a later prefill must not pair
+    # fresh Mamba state with an older attention block produced during decode.
+    for group_blocks in manager.get_blocks(donor.request_id).blocks:
+        assert (group_blocks[1].block_hash is None) == prompt_only
+    manager.free(donor)
+
+    consumer = make_request("consumer", prompt + [9001, 9002], block_size, sha256)
+    cached, hit = manager.get_computed_blocks(consumer)
+    assert hit == (block_size if prompt_only else 2 * block_size)
+    compute(
+        consumer,
+        2 * block_size - hit if prompt_only else 1,
+        num_new_computed_tokens=hit,
+        new_computed_blocks=cached,
+    )
+    if prompt_only:
+        compute(consumer, 1)
+    consumer_blocks = manager.get_blocks(consumer.request_id)
+    manager.free(consumer)
+
+    repeated = make_request("repeated", prompt + [9001, 9002], block_size, sha256)
+    cached, hit = manager.get_computed_blocks(repeated)
+    assert hit == 2 * block_size
+    assert cached.blocks[0][1] is consumer_blocks.blocks[0][1]
+
+
+@pytest.mark.parametrize("batch_invariant", [False, True])
+@pytest.mark.parametrize(
+    "mamba_type",
+    [MambaAttentionBackendEnum.QWEN_GDN_ATTN, MambaAttentionBackendEnum.MAMBA2],
+)
+@pytest.mark.parametrize("prompt_length", [63, 64, 65, 127, 128])
+def test_resumed_qwen_cache_lookup_stops_at_prompt(
+    monkeypatch, batch_invariant, mamba_type, prompt_length
+):
+    """A longer donor prompt must not replace a resumed request's decode state."""
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", batch_invariant)
+    block_size = 64
+    config = _make_hybrid_kv_cache_config(block_size, 100, ["full", "mamba_align"])
+    config.kv_cache_groups[1].kv_cache_spec = replace(
+        config.kv_cache_groups[1].kv_cache_spec, mamba_type=mamba_type
+    )
+    manager = make_kv_cache_manager(
+        config, max_model_len=512, enable_caching=True, hash_block_size=block_size
+    )
+    tokens = list(range(3 * block_size + 1))
+    donor = make_request("donor", tokens[:-1], block_size, sha256)
+    # Publish every boundary as genuine prefill, including an eligible block
+    # ending exactly at the resumed request's original prompt boundary.
+    for _ in range(3):
+        manager.new_step_starts()
+        assert manager.allocate_slots(donor, block_size) is not None
+        donor.num_computed_tokens += block_size
+    manager.free(donor)
+    manager.new_step_starts()
+
+    resumed = make_request("resumed", tokens[:prompt_length], block_size, sha256)
+    resumed.append_output_token_ids(tokens[prompt_length:])
+    resumed.num_preemptions = 1
+    cached, hit = manager.get_computed_blocks(resumed)
+    prompt_only = (
+        batch_invariant and mamba_type == MambaAttentionBackendEnum.QWEN_GDN_ATTN
+    )
+    expected = (
+        prompt_length // block_size * block_size if prompt_only else 3 * block_size
+    )
+    assert hit == expected
+    assert len(cached.blocks[0]) == expected // block_size
+
+    # A fresh prompt still needs its last token recomputed for logits. A
+    # resumed request may reuse that full prompt block and replay its output.
+    fresh = make_request("fresh", tokens[:prompt_length], block_size, sha256)
+    assert manager.get_computed_blocks(fresh)[1] == (
+        (prompt_length - 1) // block_size * block_size
+    )
 
 
 def test_prefill_hybrid_model_mamba_align():
