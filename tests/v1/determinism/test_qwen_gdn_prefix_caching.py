@@ -21,6 +21,8 @@ from tests.utils import create_new_process_for_each_test
 from vllm import SamplingParams, TokensPrompt
 from vllm.outputs import RequestOutput
 from vllm.v1.attention.backends.gdn_attn import QwenGDNAttentionBackend
+from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 
 pytestmark = [
@@ -65,6 +67,33 @@ def _worker_cache_layout(worker) -> dict:
 class PrefixCacheWorkerExtension:
     def prefix_cache_layout(self) -> dict:
         return _worker_cache_layout(self)
+
+
+class PrefillTraceScheduler(Scheduler):
+    """Record actual chunk boundaries without changing scheduling decisions."""
+
+    def _update_after_schedule(self, output):
+        path = self.vllm_config.additional_config["prefill_trace_path"]
+        with open(path, "a") as stream:
+            for request_id, count in output.num_scheduled_tokens.items():
+                request = self.requests[request_id]
+                stream.write(
+                    json.dumps(
+                        {
+                            "request_id": request_id,
+                            "start": request.num_computed_tokens,
+                            "count": count,
+                            "prompt_tokens": request.num_prompt_tokens,
+                            "preemptions": request.num_preemptions,
+                        }
+                    )
+                    + "\n"
+                )
+        return super()._update_after_schedule(output)
+
+
+class AsyncPrefillTraceScheduler(PrefillTraceScheduler, AsyncScheduler):
+    pass
 
 
 def _snapshot(output: RequestOutput) -> dict:
@@ -543,3 +572,141 @@ def test_qwen_gdn_generated_prefix_cache_exactness(
     report["complete"] = True
     checkpoint()
     assert not failures, f"See {report_path}\n" + "\n".join(failures)
+
+
+@pytest.mark.parametrize(
+    "enforce_eager,async_scheduling",
+    [(True, False), (False, True)],
+    ids=["eager-sync", "compiled-async"],
+)
+@create_new_process_for_each_test(method="spawn")
+def test_qwen_gdn_long_cached_suffix_exactness(
+    vllm_runner, tmp_path: Path, enforce_eager: bool, async_scheduling: bool
+):
+    """Reuse one/two blocks, then process a suffix larger than the token budget."""
+    model, settings = _engine_settings(enforce_eager, async_scheduling)
+    budget = settings["max_num_batched_tokens"]
+    trace_path = tmp_path / "long-suffix-scheduler.jsonl"
+    trace_path.write_text("")
+    scheduler_name = (
+        "AsyncPrefillTraceScheduler" if async_scheduling else "PrefillTraceScheduler"
+    )
+    settings["scheduler_cls"] = f"{__name__}.{scheduler_name}"
+    settings.setdefault("additional_config", {})["prefill_trace_path"] = str(trace_path)
+    sampling = SamplingParams(
+        temperature=0, seed=3407, max_tokens=32, ignore_eos=True, logprobs=5
+    )
+    donor_sampling = SamplingParams(
+        temperature=0, seed=3407, max_tokens=1, ignore_eos=True, logprobs=5
+    )
+    report: dict = {
+        "model": model,
+        "settings": settings,
+        "engines": [],
+        "runs": [],
+        "complete": False,
+    }
+    report_path = tmp_path / "long-suffix-results.json"
+
+    def checkpoint():
+        report_path.write_text(json.dumps(report, indent=2) + "\n")
+
+    def trace():
+        return [json.loads(line) for line in trace_path.read_text().splitlines()]
+
+    def run(llm, label, tokens, params, expected_hit):
+        start = len(trace())
+        [output] = llm.generate(
+            [TokensPrompt(prompt_token_ids=tokens)], params, use_tqdm=False
+        )
+        snapshot = _snapshot(output)
+        steps = trace()[start:]
+        row = {"label": label, "output": snapshot, "steps": steps}
+        report["runs"].append(row)
+        checkpoint()
+        assert len(snapshot["token_ids"]) == params.max_tokens
+        assert snapshot["num_cached_tokens"] == expected_hit, row
+        assert steps and len({step["request_id"] for step in steps}) == 1, row
+        assert all(step["preemptions"] == 0 for step in steps), row
+        prefills = [step for step in steps if step["start"] < len(tokens)]
+        position = expected_hit
+        for step in prefills:
+            assert step["start"] == position, row
+            assert 0 < step["count"] <= budget, row
+            position += step["count"]
+            if position < len(tokens):
+                assert position % 64 == 0, row
+        assert position == len(tokens), row
+        if len(tokens) - expected_hit > budget:
+            assert len(prefills) >= 2, row
+        return row
+
+    def compare(actual, expected):
+        for field in ("token_ids", "logprobs"):
+            assert actual["output"][field] == expected["output"][field], (
+                f"{actual['label']} vs {expected['label']}: {field}; see {report_path}"
+            )
+
+    def intermediate_ends(row):
+        return [
+            step["start"] + step["count"]
+            for step in row["steps"]
+            if step["start"] + step["count"] < step["prompt_tokens"]
+        ]
+
+    with vllm_runner(
+        model, enable_prefix_caching=False, mamba_cache_mode="none", **settings
+    ) as runner:
+        llm = runner.llm
+        [layout] = llm.collective_rpc("prefix_cache_layout")
+        report["engines"].append({"prefix_caching": False, **layout})
+        block_size = layout["attention_block_size"]
+        assert block_size % 64 == 0 and block_size <= budget
+        tokens = _prompts(llm.get_tokenizer(), block_size, budget + 2 * block_size)[
+            "chunk_plus1"
+        ]
+        assert len(tokens) + sampling.max_tokens < settings["max_model_len"]
+        prompts = {
+            blocks: tokens[: blocks * block_size + budget + 65] for blocks in (1, 2)
+        }
+        report["prompts"] = prompts
+        reference = {
+            blocks: run(llm, f"uncached/{blocks}-block", prompt, sampling, 0)
+            for blocks, prompt in prompts.items()
+        }
+        del llm
+
+    with vllm_runner(
+        model, enable_prefix_caching=True, mamba_cache_mode="align", **settings
+    ) as runner:
+        llm = runner.llm
+        [layout] = llm.collective_rpc("prefix_cache_layout")
+        report["engines"].append({"prefix_caching": True, **layout})
+        assert (
+            layout["attention_block_size"] == layout["mamba_block_size"] == block_size
+        )
+        for blocks, prompt in prompts.items():
+            assert llm.reset_prefix_cache()
+            cold = run(llm, f"cold/{blocks}-block", prompt, sampling, 0)
+            compare(cold, reference[blocks])
+            assert llm.reset_prefix_cache()
+            cached_tokens = blocks * block_size
+            run(
+                llm,
+                f"donor/{blocks}-block",
+                prompt[:cached_tokens],
+                donor_sampling,
+                0,
+            )
+            warm = run(llm, f"hit/{blocks}-block", prompt, sampling, cached_tokens)
+            compare(warm, cold)
+            compare(warm, reference[blocks])
+
+            # Cache reuse must actually change the prefill partition, not just
+            # repeat the same boundaries with a different hit counter.
+            assert intermediate_ends(warm)
+            assert intermediate_ends(warm) != intermediate_ends(cold)
+            assert intermediate_ends(warm) != intermediate_ends(reference[blocks])
+        del llm
+    report["complete"] = True
+    checkpoint()
