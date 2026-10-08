@@ -325,7 +325,13 @@ class Scheduler(SchedulerInterface):
         #                       num_prompt_tokens + num_output_tokens
         #                     )
         # NOTE: Use `request.num_tokens - 1` to bypass normal decoding.
-        if num_computed_tokens < max(request.num_prompt_tokens, request.num_tokens - 1):
+        prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
+        cache_end = request.num_tokens
+        if self.need_qwen_gdn_prefill_alignment:
+            # Batch-invariant GDN replays generated tokens through decode.
+            # Only the original prompt needs prefill/cache-block alignment.
+            prefill_end = cache_end = request.num_prompt_tokens
+        if num_computed_tokens < prefill_end:
             # To enable block-aligned caching of the Mamba state, `num_new_tokens`
             # must be a multiple of `block_size`.
             # As an exception, if `num_new_tokens` is less than `block_size`, the
@@ -334,7 +340,7 @@ class Scheduler(SchedulerInterface):
             # matching block. To prevent this from causing a Mamba cache miss, the
             # last chunk must be not smaller than `block_size`.
             block_size = self.cache_config.block_size
-            last_cache_position = request.num_tokens - request.num_tokens % block_size
+            last_cache_position = cache_end - cache_end % block_size
             # eagle prune
             if self.use_eagle:
                 last_cache_position = max(last_cache_position - block_size, 0)
@@ -361,17 +367,22 @@ class Scheduler(SchedulerInterface):
         num_new_local_computed_tokens: int = 0,
         num_external_computed_tokens: int = 0,
     ) -> int:
-        """Keep intermediate dense Qwen GDN prefills on the kernel chunk grid."""
+        """Align prompt chunks and replay generated tokens through decode."""
         start = (
             request.num_computed_tokens
             + num_new_local_computed_tokens
             + num_external_computed_tokens
         )
-        prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
+        prefill_end = request.num_prompt_tokens
         if start >= prefill_end:
-            return num_new_tokens
+            # After preemption, replay the recorded output one token at a time
+            # using the same recurrent kernel as uninterrupted decoding. The
+            # runner discards samples until we catch up with the saved tokens.
+            return min(num_new_tokens, 1)
 
-        end = start + num_new_tokens
+        # Never combine the prompt's last chunk with previously generated text:
+        # the chunk and recurrent kernels have different rounding.
+        end = min(start + num_new_tokens, prefill_end)
         if end < prefill_end:
             end = end // _QWEN_GDN_PREFILL_CHUNK_SIZE
             end *= _QWEN_GDN_PREFILL_CHUNK_SIZE

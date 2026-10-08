@@ -46,6 +46,87 @@ pytestmark = pytest.mark.cpu_test
 
 
 @pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize("cache_enabled", [False, True])
+@pytest.mark.parametrize("prompt_tokens", [63, 65])
+def test_qwen_gdn_preemption_replays_output_through_decode(
+    monkeypatch, async_scheduling, cache_enabled, prompt_tokens
+):
+    """Rebuild the prompt, then replay output without generating extra tokens."""
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    cache_mode = "align" if cache_enabled else "none"
+    scheduler = create_scheduler(
+        async_scheduling=async_scheduling,
+        enable_prefix_caching=cache_enabled,
+        block_size=64,
+        max_num_batched_tokens=256,
+        max_model_len=512,
+        kv_cache_spec=MambaSpec(
+            block_size=64,
+            shapes=((1, 1),),
+            dtypes=(torch.float32,),
+            mamba_type=MambaAttentionBackendEnum.QWEN_GDN_ATTN,
+            mamba_cache_mode=cache_mode,
+        ),
+        mamba_cache_mode=cache_mode,
+    )
+    [request] = create_requests(
+        num_requests=1, num_tokens=prompt_tokens, block_size=64, max_tokens=100
+    )
+    scheduler.add_request(request)
+
+    def complete_step(output):
+        # Match the runner: partial recomputation discards its sample.
+        scheduler.update_from_output(
+            output,
+            ModelRunnerOutput(
+                req_ids=[request.request_id],
+                req_id_to_index={request.request_id: 0},
+                sampled_token_ids=[[] if request.is_prefill_chunk else [42]],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )
+
+    while request.num_output_tokens < 70:
+        complete_step(scheduler.schedule())
+    saved_output = list(request.output_token_ids)
+    scheduler.running.remove(request)
+    scheduler._preempt_request(request, timestamp=0.0)
+    # A real pressure step leaves the victim out of that step's worker batch.
+    scheduler.prev_step_scheduled_req_ids.discard(request.request_id)
+    assert request.num_computed_tokens == 0
+
+    # Prompt blocks can be reused, but generated blocks must be replayed.
+    cached = scheduler.kv_cache_manager.get_computed_blocks(request)[1]
+    assert cached == (64 if cache_enabled and prompt_tokens == 65 else 0)
+    output = scheduler.schedule()
+    first_count = output.num_scheduled_tokens[request.request_id]
+    assert cached + first_count <= prompt_tokens
+    complete_step(output)
+
+    while request.num_computed_tokens < request.num_tokens:
+        start = request.num_computed_tokens
+        output = scheduler.schedule()
+        count = output.num_scheduled_tokens[request.request_id]
+        if start < prompt_tokens:
+            assert start + count == prompt_tokens
+        else:
+            assert count == 1
+        if request.is_prefill_chunk:
+            assert request.num_output_placeholders == 0
+            complete_step(output)
+            assert list(request.output_token_ids) == saved_output
+        else:
+            assert request.num_computed_tokens == prompt_tokens + len(saved_output)
+            complete_step(output)
+            break
+    assert list(request.output_token_ids) == saved_output + [42]
+    assert request.num_output_placeholders == 0
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
 def test_qwen_gdn_batch_invariant_prefill_uses_fixed_chunks(
     monkeypatch: pytest.MonkeyPatch, async_scheduling: bool
 ):
