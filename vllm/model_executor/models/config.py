@@ -567,11 +567,6 @@ class Qwen3_5ForConditionalGenerationConfig(VerifyAndUpdateConfig):
         """
         cache_config = vllm_config.cache_config
         hf_text_config = vllm_config.model_config.hf_text_config
-        if envs.VLLM_BATCH_INVARIANT and hf_text_config.model_type == "qwen3_5_text":
-            Qwen3_5ForConditionalGenerationConfig._verify_batch_invariant_profile(
-                vllm_config
-            )
-
         mamba_ssm_dtype = getattr(hf_text_config, "mamba_ssm_dtype", None)
         if cache_config.mamba_ssm_cache_dtype == "auto":
             if mamba_ssm_dtype is not None:
@@ -588,16 +583,37 @@ class Qwen3_5ForConditionalGenerationConfig(VerifyAndUpdateConfig):
                 cache_config.mamba_ssm_cache_dtype,
             )
 
+        # Validate after resolving the checkpoint's preferred state dtype.
+        if envs.VLLM_BATCH_INVARIANT and hf_text_config.model_type == "qwen3_5_text":
+            Qwen3_5ForConditionalGenerationConfig._verify_batch_invariant_profile(
+                vllm_config
+            )
+
     @staticmethod
     def _verify_batch_invariant_profile(vllm_config: "VllmConfig") -> None:
         """Validate the dense Qwen GDN batch-invariance configuration."""
+        from vllm.model_executor.layers.mamba.mamba_utils import (
+            MambaStateDtypeCalculator,
+        )
+
         model_config = vllm_config.model_config
+        cache_config = vllm_config.cache_config
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config
         invalid_reasons: list[str] = []
 
         if model_config.dtype not in (torch.bfloat16, torch.float16):
             invalid_reasons.append("dtype must be bfloat16 or float16")
+        _, ssm_dtype = MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+            model_config.dtype,
+            cache_config.mamba_cache_dtype,
+            cache_config.mamba_ssm_cache_dtype,
+        )
+        if ssm_dtype != torch.float32:
+            invalid_reasons.append(
+                "SSM cache dtype must resolve to float32 "
+                f"(got {ssm_dtype}); set --mamba-ssm-cache-dtype=float32"
+            )
         has_quantized_weights = (
             model_config.quantization is not None
             or model_config.quantization_config is not None

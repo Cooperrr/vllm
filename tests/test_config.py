@@ -94,13 +94,19 @@ def _qwen_gdn_batch_invariant_config() -> SimpleNamespace:
             quantization=None,
             quantization_config=None,
             is_quantized=False,
-            hf_text_config=SimpleNamespace(quantization_config=None),
+            hf_text_config=SimpleNamespace(
+                model_type="qwen3_5_text",
+                quantization_config=None,
+                mamba_ssm_dtype="float32",
+            ),
             model_arch_config=SimpleNamespace(quantization_config=None),
             multimodal_config=SimpleNamespace(language_model_only=True),
         ),
         cache_config=SimpleNamespace(
             enable_prefix_caching=False,
             mamba_cache_mode="none",
+            mamba_cache_dtype="auto",
+            mamba_ssm_cache_dtype="float32",
         ),
         parallel_config=SimpleNamespace(
             tensor_parallel_size=1,
@@ -132,6 +138,67 @@ def test_qwen_gdn_batch_invariant_profile_accepts_supported_config(
     config.cache_config.mamba_cache_mode = "align" if prefix_caching else "none"
 
     Qwen3_5ForConditionalGenerationConfig._verify_batch_invariant_profile(config)
+
+
+@pytest.mark.parametrize("model_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "ssm_dtype,hf_dtype,cache_dtype,supported",
+    [
+        ("auto", "float32", "auto", True),
+        ("auto", "float32", "bfloat16", True),
+        ("auto", None, "float32", True),
+        ("float32", None, "auto", True),
+        ("float32", "bfloat16", "auto", True),
+        ("auto", None, "auto", False),
+        ("auto", None, "bfloat16", False),
+        ("auto", "bfloat16", "float32", False),
+        ("auto", "float16", "auto", False),
+        ("bfloat16", "float32", "auto", False),
+        ("float16", "float32", "float32", False),
+    ],
+)
+def test_qwen_gdn_batch_invariant_profile_resolves_ssm_dtype(
+    monkeypatch, model_dtype, ssm_dtype, hf_dtype, cache_dtype, supported
+):
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    config = _qwen_gdn_batch_invariant_config()
+    config.model_config.dtype = model_dtype
+    config.cache_config.mamba_ssm_cache_dtype = ssm_dtype
+    config.cache_config.mamba_cache_dtype = cache_dtype
+    if hf_dtype is None:
+        del config.model_config.hf_text_config.mamba_ssm_dtype
+    else:
+        config.model_config.hf_text_config.mamba_ssm_dtype = hf_dtype
+
+    verify = Qwen3_5ForConditionalGenerationConfig.verify_and_update_config
+    if supported:
+        verify(config)
+        expected = hf_dtype if ssm_dtype == "auto" and hf_dtype else ssm_dtype
+        assert config.cache_config.mamba_ssm_cache_dtype == expected
+    else:
+        with pytest.raises(
+            ValueError,
+            match="SSM cache dtype must resolve to float32.*"
+            "set --mamba-ssm-cache-dtype=float32",
+        ):
+            verify(config)
+
+
+@pytest.mark.parametrize(
+    "batch_invariant,model_type",
+    [(False, "qwen3_5_text"), (True, "qwen3_5_moe_text")],
+)
+def test_qwen_gdn_ssm_dtype_restriction_is_profile_specific(
+    monkeypatch, batch_invariant, model_type
+):
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", batch_invariant)
+    config = _qwen_gdn_batch_invariant_config()
+    config.model_config.hf_text_config.model_type = model_type
+    config.cache_config.mamba_ssm_cache_dtype = "bfloat16"
+
+    Qwen3_5ForConditionalGenerationConfig.verify_and_update_config(config)
+
+    assert config.cache_config.mamba_ssm_cache_dtype == "bfloat16"
 
 
 @pytest.mark.parametrize(
@@ -185,6 +252,7 @@ def test_qwen_gdn_batch_invariant_profile_accepts_compressed_tensors_fp8(
 def test_qwen_gdn_batch_invariant_profile_reports_all_violations():
     config = _qwen_gdn_batch_invariant_config()
     config.model_config.dtype = torch.float32
+    config.cache_config.mamba_ssm_cache_dtype = "bfloat16"
     config.model_config.quantization = "fp8"
     config.model_config.multimodal_config.language_model_only = False
     config.parallel_config.tensor_parallel_size = 2
@@ -202,6 +270,7 @@ def test_qwen_gdn_batch_invariant_profile_reports_all_violations():
     message = str(exc_info.value)
     expected_reasons = (
         "dtype must be bfloat16 or float16",
+        "SSM cache dtype must resolve to float32",
         "quantized weights must use compressed-tensors FP8",
         "--language-model-only must be enabled",
         "tensor parallel size must be 1",

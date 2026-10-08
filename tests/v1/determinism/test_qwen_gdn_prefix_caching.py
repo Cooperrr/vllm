@@ -37,7 +37,9 @@ def _worker_cache_layout(worker) -> dict:
     specs = worker.get_kv_cache_spec().values()
     mamba = next(spec for spec in specs if isinstance(spec, MambaSpec))
     attention = next(spec for spec in specs if isinstance(spec, FullAttentionSpec))
+    assert mamba.dtypes[1] == torch.float32, mamba.dtypes
     return {
+        "mamba_state_dtypes": [str(dtype) for dtype in mamba.dtypes],
         "mamba_block_size": mamba.block_size,
         "mamba_page_size_padded": mamba.page_size_padded,
         "mamba_page_size_bytes": mamba.page_size_bytes,
