@@ -267,6 +267,17 @@ class Scheduler(SchedulerInterface):
         self.need_qwen_gdn_prefill_alignment = (
             envs.VLLM_BATCH_INVARIANT and kv_cache_config.has_qwen_gdn_layers
         )
+        if (
+            self.need_mamba_block_aligned_split
+            and self.need_qwen_gdn_prefill_alignment
+            and self.cache_config.block_size % _QWEN_GDN_PREFILL_CHUNK_SIZE != 0
+        ):
+            # GDN alignment must not shorten a cache-block-aligned chunk.
+            raise ValueError(
+                "Qwen GDN batch invariance with Mamba align caching requires "
+                f"block_size ({self.cache_config.block_size}) to be a multiple "
+                f"of {_QWEN_GDN_PREFILL_CHUNK_SIZE}."
+            )
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
             self.perf_metrics = ModelMetrics(vllm_config)

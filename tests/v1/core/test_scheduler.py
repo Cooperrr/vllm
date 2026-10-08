@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
+from contextlib import nullcontext
 from unittest.mock import Mock
 
 import pytest
@@ -112,6 +113,52 @@ def test_qwen_gdn_prefill_alignment_is_batch_invariant_only(
     output = scheduler.schedule()
 
     assert output.num_scheduled_tokens[request.request_id] == 100
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize("block_size", [528, 544])
+@pytest.mark.parametrize(
+    "batch_invariant,mamba_type,cache_mode",
+    [
+        (True, MambaAttentionBackendEnum.QWEN_GDN_ATTN, "align"),
+        (False, MambaAttentionBackendEnum.QWEN_GDN_ATTN, "align"),
+        (True, MambaAttentionBackendEnum.MAMBA2, "align"),
+        (True, MambaAttentionBackendEnum.QWEN_GDN_ATTN, "none"),
+    ],
+)
+def test_qwen_gdn_prefill_rejects_incompatible_cache_boundaries(
+    monkeypatch, async_scheduling, block_size, batch_invariant, mamba_type, cache_mode
+):
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", str(int(batch_invariant)))
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", batch_invariant)
+    needs_both_splits = (
+        batch_invariant
+        and mamba_type == MambaAttentionBackendEnum.QWEN_GDN_ATTN
+        and cache_mode == "align"
+    )
+    expected = (
+        pytest.raises(
+            ValueError,
+            match=rf"Qwen GDN.*block_size \({block_size}\).*multiple of 64",
+        )
+        if needs_both_splits
+        else nullcontext()
+    )
+    with expected:
+        create_scheduler(
+            async_scheduling=async_scheduling,
+            enable_prefix_caching=cache_mode == "align",
+            block_size=block_size,
+            max_num_batched_tokens=2048,
+            kv_cache_spec=MambaSpec(
+                block_size=block_size,
+                shapes=((1, 1),),
+                dtypes=(torch.float32,),
+                mamba_type=mamba_type,
+                mamba_cache_mode=cache_mode,
+            ),
+            mamba_cache_mode=cache_mode,
+        )
 
 
 @pytest.mark.parametrize("async_scheduling", [False, True])
