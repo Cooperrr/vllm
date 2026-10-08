@@ -159,6 +159,12 @@ def _cached_get_mamba_attn_backend(
 
     mamba_attn_backend = mamba_type.get_class()
     if envs.VLLM_BATCH_INVARIANT and not mamba_attn_backend.supports_batch_invariance():
+        if mamba_type == MambaAttentionBackendEnum.GDN_ATTN:
+            raise RuntimeError(
+                "VLLM batch_invariant mode for Gated DeltaNet models is currently "
+                "supported only for dense Qwen3.5 (qwen3_5_text). "
+                "Disable VLLM_BATCH_INVARIANT for other GDN models."
+            )
         raise RuntimeError(
             "VLLM batch_invariant mode is not supported for "
             f"{mamba_attn_backend.get_name()}."
