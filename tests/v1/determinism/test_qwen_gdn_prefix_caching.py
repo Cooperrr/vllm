@@ -34,11 +34,22 @@ pytestmark = [
 
 def _worker_cache_layout(worker) -> dict:
     """Read finalized allocation from the worker, not the frontend's config copy."""
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+        ChunkGatedDeltaRule,
+    )
+
+    prefill_backends = {
+        module.gdn_prefill_backend
+        for module in worker.model_runner.get_model().modules()
+        if isinstance(module, ChunkGatedDeltaRule)
+    }
+    assert len(prefill_backends) == 1, prefill_backends
     specs = worker.get_kv_cache_spec().values()
     mamba = next(spec for spec in specs if isinstance(spec, MambaSpec))
     attention = next(spec for spec in specs if isinstance(spec, FullAttentionSpec))
     assert mamba.dtypes[1] == torch.float32, mamba.dtypes
     return {
+        "gdn_prefill_backend": next(iter(prefill_backends)),
         "mamba_state_dtypes": [str(dtype) for dtype in mamba.dtypes],
         "mamba_block_size": mamba.block_size,
         "mamba_page_size_padded": mamba.page_size_padded,
@@ -139,7 +150,6 @@ def _engine_settings(enforce_eager: bool, async_scheduling: bool) -> tuple[str, 
         enforce_eager=enforce_eager,
         async_scheduling=async_scheduling,
         attention_config={"backend": "FLASH_ATTN"},
-        additional_config={"gdn_prefill_backend": "triton"},
         # Cache-off/on engines compile separately. Fix their reduction choices
         # so this comparison isolates prefix reuse rather than autotuning.
         # This is a test control, not a production default.
@@ -157,6 +167,9 @@ def _engine_settings(enforce_eager: bool, async_scheduling: bool) -> tuple[str, 
             "PrefixCacheWorkerExtension"
         ),
     )
+    prefill_backend = os.getenv("VLLM_GDN_TEST_PREFILL_BACKEND", "triton")
+    if prefill_backend != "auto":
+        settings["additional_config"] = {"gdn_prefill_backend": prefill_backend}
     return model, settings
 
 
