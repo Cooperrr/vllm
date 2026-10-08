@@ -1054,6 +1054,57 @@ def test_generated_gdn_blocks_are_not_published(
     assert cached.blocks[0][1] is consumer_blocks.blocks[0][1]
 
 
+@pytest.mark.parametrize("batch_invariant", [False, True])
+@pytest.mark.parametrize(
+    "mamba_type",
+    [MambaAttentionBackendEnum.QWEN_GDN_ATTN, MambaAttentionBackendEnum.MAMBA2],
+)
+@pytest.mark.parametrize("prompt_length", [63, 64, 65, 127, 128])
+def test_resumed_qwen_cache_lookup_stops_at_prompt(
+    monkeypatch, batch_invariant, mamba_type, prompt_length
+):
+    """A longer donor prompt must not replace a resumed request's decode state."""
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", batch_invariant)
+    block_size = 64
+    config = _make_hybrid_kv_cache_config(block_size, 100, ["full", "mamba_align"])
+    config.kv_cache_groups[1].kv_cache_spec = replace(
+        config.kv_cache_groups[1].kv_cache_spec, mamba_type=mamba_type
+    )
+    manager = make_kv_cache_manager(
+        config, max_model_len=512, enable_caching=True, hash_block_size=block_size
+    )
+    tokens = list(range(3 * block_size + 1))
+    donor = make_request("donor", tokens[:-1], block_size, sha256)
+    # Publish every boundary as genuine prefill, including an eligible block
+    # ending exactly at the resumed request's original prompt boundary.
+    for _ in range(3):
+        manager.new_step_starts()
+        assert manager.allocate_slots(donor, block_size) is not None
+        donor.num_computed_tokens += block_size
+    manager.free(donor)
+    manager.new_step_starts()
+
+    resumed = make_request("resumed", tokens[:prompt_length], block_size, sha256)
+    resumed.append_output_token_ids(tokens[prompt_length:])
+    resumed.num_preemptions = 1
+    cached, hit = manager.get_computed_blocks(resumed)
+    prompt_only = (
+        batch_invariant and mamba_type == MambaAttentionBackendEnum.QWEN_GDN_ATTN
+    )
+    expected = (
+        prompt_length // block_size * block_size if prompt_only else 3 * block_size
+    )
+    assert hit == expected
+    assert len(cached.blocks[0]) == expected // block_size
+
+    # A fresh prompt still needs its last token recomputed for logits. A
+    # resumed request may reuse that full prompt block and replay its output.
+    fresh = make_request("fresh", tokens[:prompt_length], block_size, sha256)
+    assert manager.get_computed_blocks(fresh)[1] == (
+        (prompt_length - 1) // block_size * block_size
+    )
+
+
 def test_prefill_hybrid_model_mamba_align():
     """Test that MambaManager.cache_blocks() handles null blocks in align mode.
 

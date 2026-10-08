@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Exact Qwen GDN recovery after real cache-pressure preemption on one GPU."""
+"""Exact Qwen GDN recovery after cache-pressure and shared-cache preemption."""
 
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -59,6 +60,149 @@ class ObservedScheduler(Scheduler):
 
 class ObservedAsyncScheduler(ObservedScheduler, AsyncScheduler):
     pass
+
+
+class SharedCachePreemptionScheduler(ObservedScheduler):
+    """Trigger one normal preemption without evicting the donor's cached state."""
+
+    def schedule(self):
+        allocate = self.kv_cache_manager.allocate_slots
+
+        def allocate_with_failure(request, *args, **kwargs):
+            params = request.sampling_params
+            threshold = (
+                (params.extra_args or {}).get("test_preempt_after") if params else None
+            )
+            if (
+                threshold is not None
+                and request.num_output_tokens >= threshold
+                and request.num_preemptions == 0
+            ):
+                # Observe the longer donor state before forcing an allocation
+                # failure. Only this failure is injected; the normal scheduler
+                # performs preemption, lookup, replay, and resumption.
+                _, unrestricted_hit = (
+                    self.kv_cache_manager.coordinator.find_longest_cache_hit(
+                        request.block_hashes, request.num_tokens - 1
+                    )
+                )
+                self._record(
+                    "allocation_failure", request, unrestricted_hit=unrestricted_hit
+                )
+                return None
+            return allocate(request, *args, **kwargs)
+
+        with patch.object(
+            self.kv_cache_manager, "allocate_slots", side_effect=allocate_with_failure
+        ):
+            return super().schedule()
+
+
+class AsyncSharedCachePreemptionScheduler(
+    SharedCachePreemptionScheduler, AsyncScheduler
+):
+    pass
+
+
+@pytest.mark.parametrize(
+    "eager,async_scheduling",
+    [(True, False), (False, True)],
+    ids=["eager-sync", "compiled-async"],
+)
+@create_new_process_for_each_test(method="spawn")
+def test_qwen_gdn_preemption_shared_prompt_cache(
+    vllm_runner, tmp_path: Path, eager: bool, async_scheduling: bool
+):
+    """A longer donor prompt cannot substitute prefill state for decoded output."""
+    model, settings = _engine_settings(eager, async_scheduling)
+    trace = tmp_path / "shared-cache-scheduler.jsonl"
+    trace.write_text("")
+    scheduler_name = (
+        "AsyncSharedCachePreemptionScheduler"
+        if async_scheduling
+        else "SharedCachePreemptionScheduler"
+    )
+    settings["scheduler_cls"] = f"{__name__}.{scheduler_name}"
+    settings.setdefault("additional_config", {})["preemption_trace_path"] = str(trace)
+    sampling = SamplingParams(
+        temperature=0, seed=3407, max_tokens=32, ignore_eos=True, logprobs=5
+    )
+    report: dict = {"settings": settings, "runs": [], "complete": False}
+
+    def events():
+        return [json.loads(line) for line in trace.read_text().splitlines()]
+
+    def checkpoint():
+        (tmp_path / "shared-cache-results.json").write_text(
+            json.dumps(report, indent=2)
+        )
+
+    with vllm_runner(
+        model, enable_prefix_caching=True, mamba_cache_mode="align", **settings
+    ) as runner:
+        llm = runner.llm
+        [layout] = llm.collective_rpc("prefix_cache_layout")
+        report["layout"] = layout
+        block_size = layout["attention_block_size"]
+        prompt = _prompts(llm.get_tokenizer(), block_size, 2048)["block_minus1"]
+        report["prompt"] = prompt
+
+        def run(label, tokens, params):
+            start = len(events())
+            [output] = llm.generate(
+                [TokensPrompt(prompt_token_ids=tokens)], params, use_tqdm=False
+            )
+            row = {
+                "label": label,
+                "output": _snapshot(output),
+                "events": events()[start:],
+            }
+            report["runs"].append(row)
+            checkpoint()
+            assert len(row["output"]["token_ids"]) == params.max_tokens
+            return row
+
+        assert llm.reset_prefix_cache()
+        reference = run("uninterrupted", prompt, sampling)
+        assert not reference["events"]
+        # Output from A is valid prefill input for another request, but the
+        # resulting state is not valid for replaying A's recurrent decoding.
+        donor_tokens = prompt + reference["output"]["token_ids"][:1]
+        one_token = sampling.clone()
+        one_token.max_tokens = 1
+        donor = run("donor", donor_tokens, one_token)
+        assert donor["output"]["num_cached_tokens"] == 0
+        probe = run(
+            "donor-hit-check", prompt + reference["output"]["token_ids"][:2], one_token
+        )
+        assert probe["output"]["num_cached_tokens"] == block_size
+        warm_control = run("donor-warmed-uninterrupted", prompt, sampling)
+        replay_sampling = sampling.clone()
+        replay_sampling.extra_args = {"test_preempt_after": 16}
+        resumed = run("donor-warmed-preempted", prompt, replay_sampling)
+
+    for control in (donor, probe, warm_control):
+        assert not control["events"]
+    failures = [e for e in resumed["events"] if e["event"] == "allocation_failure"]
+    preemptions = [e for e in resumed["events"] if e["event"] == "preempt"]
+    resumes = [e for e in resumed["events"] if e["event"] == "resume"]
+    assert len(failures) == len(preemptions) == 1 and resumes
+    assert failures[0]["unrestricted_hit"] == block_size
+    # Save the numerical outcome even when an old lookup crosses the boundary.
+    report["exact"] = all(
+        row["output"][field] == reference["output"][field]
+        for row in (warm_control, resumed)
+        for field in ("token_ids", "logprobs")
+    )
+    checkpoint()
+    assert report["exact"], f"See {tmp_path / 'shared-cache-results.json'}"
+    assert resumes[0]["computed_tokens"] == 0
+    assert resumes[0]["scheduled_tokens"] == len(prompt)
+    assert resumes[0]["output_tokens"] >= 16
+    assert all(e["scheduled_tokens"] == 1 for e in resumes[1:])
+    assert resumed["output"]["num_cached_tokens"] == 0
+    report["complete"] = True
+    checkpoint()
 
 
 @pytest.mark.parametrize(

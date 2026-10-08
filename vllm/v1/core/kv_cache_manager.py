@@ -217,12 +217,17 @@ class KVCacheManager:
             return self.empty_kv_cache_blocks, 0
 
         # NOTE: When all tokens hit the cache, we must recompute the last token
-        # to obtain logits. Thus, set max_cache_hit_length to prompt_length - 1.
+        # to obtain logits. Thus, leave at least one token to compute.
         # This can trigger recomputation of an entire block, rather than just
         # the single last token, because allocate_slots() requires
         # num_computed_tokens to be block-size aligned. Removing this limitation
         # could slightly improve performance in the future.
         max_cache_hit_length = request.num_tokens - 1
+        if self.cache_prompt_only:
+            # Another request may have cached our generated tokens as prefill.
+            # On resume, those tokens must instead replay through recurrent
+            # decode, so cache reads must stop at our original prompt boundary.
+            max_cache_hit_length = min(max_cache_hit_length, request.num_prompt_tokens)
         computed_blocks, num_new_computed_tokens = (
             self.coordinator.find_longest_cache_hit(
                 request.block_hashes, max_cache_hit_length
