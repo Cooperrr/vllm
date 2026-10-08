@@ -162,6 +162,94 @@ def test_qwen_gdn_prefill_preserves_prefix_cache_boundaries(
         )
 
 
+@pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize("batch_invariant", [False, True])
+@pytest.mark.parametrize("suffix_budget", [63, 172, 572])
+def test_qwen_gdn_cached_suffix_split_stays_on_chunk_grid(
+    monkeypatch: pytest.MonkeyPatch,
+    async_scheduling: bool,
+    batch_invariant: bool,
+    suffix_budget: int,
+):
+    """A restored final cache block can still need several prefill steps.
+
+    Reproduce actions_v14's 5756-token prompt with 5184 cached tokens.
+    Cache alignment alone permits a 172/400 split of the remaining 572 tokens;
+    batch invariance also requires intermediate ends on GDN's 64-token grid.
+    """
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", str(int(batch_invariant)))
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", batch_invariant)
+    scheduler = create_scheduler(
+        async_scheduling=async_scheduling,
+        enable_prefix_caching=True,
+        block_size=576,
+        max_num_batched_tokens=8192,
+        max_model_len=8192,
+        kv_cache_spec=MambaSpec(
+            block_size=576,
+            shapes=((1, 1),),
+            dtypes=(torch.float32,),
+            mamba_type=MambaAttentionBackendEnum.QWEN_GDN_ATTN,
+            mamba_cache_mode="align",
+        ),
+        mamba_cache_mode="align",
+    )
+    # The helper uses OPT's 2048-token model config; no model runs in this test.
+    scheduler.max_model_len = 8192
+    donor, target = create_requests(
+        num_requests=2, num_tokens=5756, block_size=576, same_prompt=True
+    )
+
+    def complete_step(output, request):
+        scheduler.update_from_output(
+            output,
+            ModelRunnerOutput(
+                req_ids=[request.request_id],
+                req_id_to_index={request.request_id: 0},
+                sampled_token_ids=[[] if request.is_prefill_chunk else [0]],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )
+
+    scheduler.add_request(donor)
+    for count in (5184, 572):
+        output = scheduler.schedule()
+        assert output.num_scheduled_tokens[donor.request_id] == count
+        complete_step(output, donor)
+    scheduler.finish_requests(donor.request_id, RequestStatus.FINISHED_STOPPED)
+    assert scheduler.kv_cache_manager.get_computed_blocks(target)[1] == 5184
+    scheduler.add_request(target)
+
+    # Simulate the budget left after other requests consume scheduler capacity.
+    scheduler.max_num_scheduled_tokens = suffix_budget
+    output = scheduler.schedule()
+    expected = suffix_budget
+    if batch_invariant and suffix_budget < 572:
+        expected = suffix_budget // 64 * 64
+    assert output.num_scheduled_tokens.get(target.request_id, 0) == expected
+    if expected:
+        complete_step(output, target)
+    else:
+        assert target.status == RequestStatus.WAITING
+
+    # Exercise both the waiting and running paths, including the final short
+    # chunk and normal decode. A tiny leftover budget must defer, not deadlock.
+    scheduler.max_num_scheduled_tokens = 172
+    for _ in range(6):
+        if target.num_computed_tokens >= target.num_prompt_tokens:
+            break
+        output = scheduler.schedule()
+        count = output.num_scheduled_tokens[target.request_id]
+        assert 0 < count <= 172
+        if batch_invariant and target.num_computed_tokens < target.num_prompt_tokens:
+            assert target.num_computed_tokens % 64 == 0
+        complete_step(output, target)
+    assert target.num_computed_tokens == 5756
+    assert scheduler.schedule().num_scheduled_tokens[target.request_id] == 1
+
+
 def test_add_requests():
     scheduler = create_scheduler()
     requests = create_requests(num_requests=10)

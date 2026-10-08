@@ -466,7 +466,10 @@ class Scheduler(SchedulerInterface):
                 num_new_tokens = self._mamba_block_aligned_split(
                     request, num_new_tokens
                 )
-            elif self.need_qwen_gdn_prefill_alignment:
+            # Mamba cache alignment allows arbitrary splits after the last
+            # cacheable block. GDN still needs intermediate suffix chunks to
+            # end on its chunk grid, so apply both constraints.
+            if self.need_qwen_gdn_prefill_alignment:
                 num_new_tokens = self._qwen_gdn_batch_invariant_split(
                     request, num_new_tokens
                 )
@@ -760,7 +763,7 @@ class Scheduler(SchedulerInterface):
                     )
                     if num_new_tokens == 0:
                         break
-                elif self.need_qwen_gdn_prefill_alignment and not load_kv_async:
+                if self.need_qwen_gdn_prefill_alignment and not load_kv_async:
                     num_new_tokens = self._qwen_gdn_batch_invariant_split(
                         request,
                         num_new_tokens,
