@@ -404,7 +404,7 @@ def test_qwen_gdn_prefix_cache_exactness(
 def test_qwen_gdn_generated_prefix_cache_exactness(
     vllm_runner, tmp_path: Path, enforce_eager: bool, async_scheduling: bool
 ):
-    """Compare generated-prefix reuse with a cold run in the same engine."""
+    """Compare uncached, cold, and reused generated prefixes across engines."""
     assert envs.VLLM_BATCH_INVARIANT
     model, settings = _engine_settings(enforce_eager, async_scheduling)
     report_path = tmp_path / "generated-prefix-cache-results.json"
@@ -449,13 +449,10 @@ def test_qwen_gdn_generated_prefix_cache_exactness(
                 failures.append(f"{label}: {field} differ at step {first}")
         checkpoint()
 
-    with vllm_runner(
-        model, enable_prefix_caching=True, mamba_cache_mode="align", **settings
-    ) as runner:
+    with vllm_runner(model, enable_prefix_caching=False, **settings) as runner:
         llm = runner.llm
         [layout] = llm.collective_rpc("prefix_cache_layout")
         block_size = layout["attention_block_size"]
-        assert layout["mamba_block_size"] == block_size
         assert block_size % 64 == 0
         assert block_size <= settings["max_num_batched_tokens"]
         report["layout"] = layout
@@ -465,25 +462,52 @@ def test_qwen_gdn_generated_prefix_cache_exactness(
         # The last sampled token has no state yet. Generate one token beyond
         # the boundary so its predecessor is processed by recurrent decode,
         # and the consumer has a one-token prompt suffix after the boundary.
+        # An extra output also checks the observed two-token cold suffix failure.
         cases = {
             "first_boundary": (prompts["block_minus1"], 2),
             "second_boundary": (prompts["two_blocks_minus1"], 2),
+            "second_boundary_plus2": (prompts["two_blocks_minus1"], 3),
             "whole_generated_block": (prompts["block_exact"], block_size + 1),
         }
         for name, (prompt, count) in cases.items():
             assert len(prompt) + count + 32 < settings["max_model_len"]
-            assert llm.reset_prefix_cache()
-            donor = generate(llm, prompt, count, name, "donor")
-            assert donor["num_cached_tokens"] == 0
+            donor = generate(llm, prompt, count, name, "uncached-donor")
             # Do not detokenize/re-encode: the consumer must reuse identical IDs.
-            consumer_prompt = prompt + donor["token_ids"]
+            consumer = prompt + donor["token_ids"]
+            reference = generate(llm, consumer, 32, name, "uncached-consumer")
+            assert donor["num_cached_tokens"] == reference["num_cached_tokens"] == 0
             report["cases"][name] = {
                 "prompt": prompt,
-                "consumer": consumer_prompt,
+                "consumer": consumer,
                 "donor": donor,
+                "reference": reference,
             }
-            consumer = generate(llm, consumer_prompt, 32, name, "consumer")
-            safe_hit = len(prompt) // block_size * block_size
+            checkpoint()
+        del llm
+
+    with vllm_runner(
+        model, enable_prefix_caching=True, mamba_cache_mode="align", **settings
+    ) as runner:
+        llm = runner.llm
+        [layout] = llm.collective_rpc("prefix_cache_layout")
+        assert (
+            layout["attention_block_size"] == layout["mamba_block_size"] == block_size
+        )
+        for name, case in report["cases"].items():
+            assert llm.reset_prefix_cache()
+            cold = generate(llm, case["consumer"], 32, name, "cold-consumer")
+            assert cold["num_cached_tokens"] == 0
+            compare(cold, case["reference"], f"{name}/cold-consumer")
+
+            assert llm.reset_prefix_cache()
+            donor = generate(
+                llm, case["prompt"], len(case["donor"]["token_ids"]), name, "donor"
+            )
+            compare(donor, case["donor"], f"{name}/donor")
+            assert donor["num_cached_tokens"] == 0
+            consumer = generate(llm, case["consumer"], 32, name, "consumer")
+            compare(consumer, case["reference"], f"{name}/consumer")
+            safe_hit = len(case["prompt"]) // block_size * block_size
             if consumer["num_cached_tokens"] != safe_hit:
                 failures.append(
                     f"{name}/consumer: expected {safe_hit} prompt-only cached tokens, "
@@ -492,20 +516,13 @@ def test_qwen_gdn_generated_prefix_cache_exactness(
 
             # Once computed as prefill, those same tokens are safe to reuse.
             # Also catch mismatched attention/SSM states from earlier donors.
-            repeated = generate(llm, consumer_prompt, 32, name, "repeated-consumer")
-            expected_hit = (len(consumer_prompt) - 1) // block_size * block_size
+            repeated = generate(llm, case["consumer"], 32, name, "repeated-consumer")
+            compare(repeated, case["reference"], f"{name}/repeated-consumer")
+            expected_hit = (len(case["consumer"]) - 1) // block_size * block_size
             if repeated["num_cached_tokens"] != expected_hit:
                 failures.append(
                     f"{name}/repeated-consumer: expected {expected_hit} hit"
                 )
-
-            # Keep the engine and scheduling mode fixed to isolate publication
-            # of decode-produced blocks from cold cache-on/off split differences.
-            assert llm.reset_prefix_cache()
-            cold = generate(llm, consumer_prompt, 32, name, "cold-consumer")
-            assert cold["num_cached_tokens"] == 0
-            compare(consumer, cold, f"{name}/consumer")
-            compare(repeated, cold, f"{name}/repeated-consumer")
         del llm
 
     report["complete"] = True
