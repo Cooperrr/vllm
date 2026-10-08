@@ -118,24 +118,13 @@ def _prompts(tokenizer, block_size: int, token_budget: int) -> dict[str, list[in
     return prompts
 
 
-@pytest.mark.parametrize("async_scheduling", [False, True], ids=["sync", "async"])
-@pytest.mark.parametrize("enforce_eager", [True, False], ids=["eager", "compiled"])
-@create_new_process_for_each_test(method="spawn")
-def test_qwen_gdn_prefix_cache_exactness(
-    vllm_runner,
-    tmp_path: Path,
-    enforce_eager: bool,
-    async_scheduling: bool,
-):
-    """Compare uncached, cold, repeated and shared-prefix requests exactly."""
-    assert envs.VLLM_BATCH_INVARIANT
+def _engine_settings(enforce_eager: bool, async_scheduling: bool) -> tuple[str, dict]:
     model = os.getenv("VLLM_TEST_MODEL", "Qwen/Qwen3.5-0.8B")
     token_budget = int(os.getenv("VLLM_GDN_TEST_TOKEN_BUDGET", "2048"))
     assert token_budget >= 128, "Use a token budget of at least 128"
     model_len = int(
         os.getenv("VLLM_GDN_TEST_MAX_MODEL_LEN", str(max(8192, token_budget + 4096)))
     )
-    generation_tokens = 32
     settings = dict(
         dtype="bfloat16",
         language_model_only=True,
@@ -166,6 +155,24 @@ def test_qwen_gdn_prefix_cache_exactness(
             "PrefixCacheWorkerExtension"
         ),
     )
+    return model, settings
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("enforce_eager", [True, False], ids=["eager", "compiled"])
+@create_new_process_for_each_test(method="spawn")
+def test_qwen_gdn_prefix_cache_exactness(
+    vllm_runner,
+    tmp_path: Path,
+    enforce_eager: bool,
+    async_scheduling: bool,
+):
+    """Compare uncached, cold, repeated and shared-prefix requests exactly."""
+    assert envs.VLLM_BATCH_INVARIANT
+    model, settings = _engine_settings(enforce_eager, async_scheduling)
+    token_budget = settings["max_num_batched_tokens"]
+    model_len = settings["max_model_len"]
+    generation_tokens = 32
     sampling = SamplingParams(
         temperature=0.0,
         seed=3407,
@@ -384,6 +391,121 @@ def test_qwen_gdn_prefix_cache_exactness(
         reset = generate(llm, ["chunk_plus1"], prompts, "after-reset")
         check_hits(reset, set(), "after-reset")
         compare(reset, reference, "after-reset")
+        del llm
+
+    report["complete"] = True
+    checkpoint()
+    assert not failures, f"See {report_path}\n" + "\n".join(failures)
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("enforce_eager", [True, False], ids=["eager", "compiled"])
+@create_new_process_for_each_test(method="spawn")
+def test_qwen_gdn_generated_prefix_cache_exactness(
+    vllm_runner, tmp_path: Path, enforce_eager: bool, async_scheduling: bool
+):
+    """Compare generated-prefix reuse with a cold run in the same engine."""
+    assert envs.VLLM_BATCH_INVARIANT
+    model, settings = _engine_settings(enforce_eager, async_scheduling)
+    report_path = tmp_path / "generated-prefix-cache-results.json"
+    failures: list[str] = []
+    report = {
+        "model": model,
+        "settings": settings,
+        "gpu": torch.cuda.get_device_name(),
+        "cases": {},
+        "runs": [],
+        "failures": failures,
+        "complete": False,
+    }
+
+    def checkpoint():
+        report_path.write_text(json.dumps(report, indent=2) + "\n")
+
+    def generate(llm, tokens, count, case, scenario):
+        [output] = llm.generate(
+            [TokensPrompt(prompt_token_ids=tokens)],
+            SamplingParams(
+                temperature=0.0, max_tokens=count, ignore_eos=True, logprobs=5
+            ),
+            use_tqdm=False,
+        )
+        assert output.prompt_token_ids == tokens
+        result = _snapshot(output)
+        assert len(result["token_ids"]) == count
+        report["runs"].append({"case": case, "scenario": scenario, **result})
+        checkpoint()
+        print(f"{case}/{scenario}: cached={result['num_cached_tokens']}", flush=True)
+        return result
+
+    def compare(actual, expected, label):
+        for field in ("token_ids", "logprobs"):
+            if actual[field] != expected[field]:
+                first = next(
+                    i
+                    for i, (a, b) in enumerate(zip(actual[field], expected[field]))
+                    if a != b
+                )
+                failures.append(f"{label}: {field} differ at step {first}")
+        checkpoint()
+
+    with vllm_runner(
+        model, enable_prefix_caching=True, mamba_cache_mode="align", **settings
+    ) as runner:
+        llm = runner.llm
+        [layout] = llm.collective_rpc("prefix_cache_layout")
+        block_size = layout["attention_block_size"]
+        assert layout["mamba_block_size"] == block_size
+        assert block_size % 64 == 0
+        assert block_size <= settings["max_num_batched_tokens"]
+        report["layout"] = layout
+        prompts = _prompts(
+            llm.get_tokenizer(), block_size, settings["max_num_batched_tokens"]
+        )
+        # The last sampled token has no state yet. Generate one token beyond
+        # the boundary so its predecessor is processed by recurrent decode,
+        # and the consumer has a one-token prompt suffix after the boundary.
+        cases = {
+            "first_boundary": (prompts["block_minus1"], 2),
+            "second_boundary": (prompts["two_blocks_minus1"], 2),
+            "whole_generated_block": (prompts["block_exact"], block_size + 1),
+        }
+        for name, (prompt, count) in cases.items():
+            assert len(prompt) + count + 32 < settings["max_model_len"]
+            assert llm.reset_prefix_cache()
+            donor = generate(llm, prompt, count, name, "donor")
+            assert donor["num_cached_tokens"] == 0
+            # Do not detokenize/re-encode: the consumer must reuse identical IDs.
+            consumer_prompt = prompt + donor["token_ids"]
+            report["cases"][name] = {
+                "prompt": prompt,
+                "consumer": consumer_prompt,
+                "donor": donor,
+            }
+            consumer = generate(llm, consumer_prompt, 32, name, "consumer")
+            safe_hit = len(prompt) // block_size * block_size
+            if consumer["num_cached_tokens"] != safe_hit:
+                failures.append(
+                    f"{name}/consumer: expected {safe_hit} prompt-only cached tokens, "
+                    f"got {consumer['num_cached_tokens']}"
+                )
+
+            # Once computed as prefill, those same tokens are safe to reuse.
+            # Also catch mismatched attention/SSM states from earlier donors.
+            repeated = generate(llm, consumer_prompt, 32, name, "repeated-consumer")
+            expected_hit = (len(consumer_prompt) - 1) // block_size * block_size
+            if repeated["num_cached_tokens"] != expected_hit:
+                failures.append(
+                    f"{name}/repeated-consumer: expected {expected_hit} hit"
+                )
+
+            # Keep the engine and scheduling mode fixed to isolate publication
+            # of decode-produced blocks from cold cache-on/off split differences.
+            assert llm.reset_prefix_cache()
+            cold = generate(llm, consumer_prompt, 32, name, "cold-consumer")
+            assert cold["num_cached_tokens"] == 0
+            compare(consumer, cold, f"{name}/consumer")
+            compare(repeated, cold, f"{name}/repeated-consumer")
         del llm
 
     report["complete"] = True
